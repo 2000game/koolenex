@@ -57,7 +57,17 @@ async function req<T = unknown>(
   } else if (isFormData) {
     opts.body = body as FormData;
   }
-  const res = await fetch(BASE + path, opts);
+  let res: Response;
+  try {
+    res = await fetch(BASE + path, opts);
+  } catch (e) {
+    // fetch() rejects with TypeError on network failure, abort, or browser
+    // socket timeout — surfacing the original message as "Failed to fetch"
+    // tells the user nothing. Wrap it so the cause is at least named.
+    throw new ApiError(
+      `Network error or request timed out (${(e as Error).message}). Check the server console for details.`,
+    );
+  }
   const data = await res.json();
   if (!res.ok) {
     const e = new ApiError(data.error || res.statusText);

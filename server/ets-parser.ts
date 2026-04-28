@@ -346,9 +346,19 @@ export function parseKnxproj(
   buffer: Buffer,
   password: string | null = null,
 ): ParsedProject {
+  const tParseStart = Date.now();
+  logger.info('ets', 'parse start', {
+    bytes: buffer.length,
+    hasPassword: !!password,
+  });
   let entries: ZipEntry[];
   try {
+    const tOuter = Date.now();
     entries = openZip(buffer);
+    logger.info('ets', 'outer zip opened', {
+      entries: entries.length,
+      ms: Date.now() - tOuter,
+    });
   } catch (e: unknown) {
     throw new Error(
       'Invalid or corrupt .knxproj file: ' + (e as Error).message,
@@ -377,16 +387,52 @@ export function parseKnxproj(
     )
       continue;
 
-    if (!password)
+    logger.info('ets', 'inner encrypted zip detected', {
+      name: innerZipEntry.entryName,
+    });
+
+    if (!password) {
+      logger.info('ets', 'password required (inner zip)', {
+        name: innerZipEntry.entryName,
+      });
       throw Object.assign(new Error('Project is password-protected'), {
         code: 'PASSWORD_REQUIRED',
       });
+    }
 
     const zipPw = deriveZipPassword(password);
     let innerEntries: ZipEntry[];
+    let innerBuf: Buffer;
     try {
-      innerEntries = openZip(innerZipEntry.getData(), zipPw);
-    } catch (_) {
+      const tRead = Date.now();
+      innerBuf = innerZipEntry.getData();
+      logger.info('ets', 'inner zip read', {
+        name: innerZipEntry.entryName,
+        bytes: innerBuf.length,
+        ms: Date.now() - tRead,
+      });
+    } catch (e) {
+      logger.warn('ets', 'inner zip read failed', {
+        name: innerZipEntry.entryName,
+        error: (e as Error).message,
+      });
+      throw Object.assign(new Error('Incorrect password'), {
+        code: 'PASSWORD_INCORRECT',
+      });
+    }
+    try {
+      const tOpen = Date.now();
+      innerEntries = openZip(innerBuf, zipPw);
+      logger.info('ets', 'inner zip opened', {
+        entries: innerEntries.length,
+        ms: Date.now() - tOpen,
+      });
+    } catch (e) {
+      logger.warn('ets', 'inner zip open failed', {
+        name: innerZipEntry.entryName,
+        bytes: innerBuf.length,
+        error: (e as Error).message,
+      });
       throw Object.assign(new Error('Incorrect password'), {
         code: 'PASSWORD_INCORRECT',
       });
@@ -458,11 +504,18 @@ export function parseKnxproj(
   // ── Password-protection check ──────────────────────────────────────────────
   // Encrypted project files are binary (not XML). Detect early and validate
   // the password before attempting full parsing.
+  logger.info('ets', 'installation files found', {
+    count: installEntries.length,
+  });
   for (const entry of installEntries) {
     let raw: Buffer;
     try {
       raw = entry.getData();
-    } catch (_) {
+    } catch (e) {
+      logger.warn('ets', 'installation entry read failed', {
+        name: entry.entryName,
+        error: (e as Error).message,
+      });
       // getData() failed — the outer ZIP entry itself is password-protected
       if (!password)
         throw Object.assign(new Error('Project is password-protected'), {
@@ -472,14 +525,29 @@ export function parseKnxproj(
         code: 'PASSWORD_INCORRECT',
       });
     }
-    if (!looksEncrypted(raw)) break; // plaintext — no password needed
+    const encrypted = looksEncrypted(raw);
+    logger.info('ets', 'installation entry', {
+      name: entry.entryName,
+      bytes: raw.length,
+      encrypted,
+    });
+    if (!encrypted) break; // plaintext — no password needed
     if (!password)
       throw Object.assign(new Error('Project is password-protected'), {
         code: 'PASSWORD_REQUIRED',
       });
     try {
+      const tDecrypt = Date.now();
       decryptEntry(raw, password);
-    } catch (_) {
+      logger.info('ets', 'installation entry decrypted', {
+        name: entry.entryName,
+        ms: Date.now() - tDecrypt,
+      });
+    } catch (e) {
+      logger.warn('ets', 'installation entry decrypt failed', {
+        name: entry.entryName,
+        error: (e as Error).message,
+      });
       throw Object.assign(new Error('Incorrect password'), {
         code: 'PASSWORD_INCORRECT',
       });
@@ -1033,6 +1101,14 @@ export function parseKnxproj(
       thumbnail = jpgEntry.getData().toString('base64');
     } catch (_) {}
   }
+
+  logger.info('ets', 'parse complete', {
+    devices: devices.length,
+    groupAddresses: groupAddresses.length,
+    comObjects: comObjects.length,
+    spaces: spaces.length,
+    ms: Date.now() - tParseStart,
+  });
 
   return {
     projectName,

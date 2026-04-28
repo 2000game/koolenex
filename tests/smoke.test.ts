@@ -681,7 +681,7 @@ describe('Import/Reimport Error Paths', () => {
     );
     const { status, data } = await req('POST', '/projects/import', form, true);
     assert.equal(status, 422);
-    assert.equal(data.error, 'Parse failed');
+    assert.match(data.error, /^Parse failed: /);
   });
 
   it('POST /import with binary (non-XML, non-encrypted) buffer returns 422', async () => {

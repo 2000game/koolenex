@@ -10,6 +10,7 @@
 
 import { createRequire } from 'module';
 import crypto from 'crypto';
+import { logger } from './log.ts';
 
 export interface MinizipEntry {
   filepath: string;
@@ -70,6 +71,7 @@ export function looksEncrypted(buf: Buffer | null | undefined): boolean {
  * ETS6 uses PBKDF2-HMAC-SHA256 with a fixed salt, then base64-encodes the result.
  */
 export function deriveZipPassword(password: string): string {
+  const t0 = Date.now();
   const derived = crypto.pbkdf2Sync(
     Buffer.from(password, 'utf16le'),
     '21.project.ets.knx.org',
@@ -77,6 +79,7 @@ export function deriveZipPassword(password: string): string {
     32,
     'sha256',
   );
+  logger.info('ets', 'pbkdf2 (zip) done', { ms: Date.now() - t0 });
   return derived.toString('base64');
 }
 
@@ -92,6 +95,7 @@ export function decryptEntry(buf: Buffer, password: string): Buffer {
   const iterations = buf.readUInt32BE(20);
   const iv = buf.slice(24, 40);
   const data = buf.slice(40);
+  const tPbkdf2 = Date.now();
   const key = crypto.pbkdf2Sync(
     Buffer.from(password, 'utf16le'),
     salt,
@@ -99,10 +103,24 @@ export function decryptEntry(buf: Buffer, password: string): Buffer {
     32,
     'sha256',
   );
+  logger.info('ets', 'pbkdf2 (file) done', {
+    iterations,
+    bytes: data.length,
+    ms: Date.now() - tPbkdf2,
+  });
   try {
+    const tAes = Date.now();
     const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-    return Buffer.concat([decipher.update(data), decipher.final()]);
-  } catch (_) {
+    const out = Buffer.concat([decipher.update(data), decipher.final()]);
+    logger.info('ets', 'aes-cbc decrypt done', {
+      bytes: data.length,
+      ms: Date.now() - tAes,
+    });
+    return out;
+  } catch (e) {
+    logger.warn('ets', 'aes-cbc decrypt failed', {
+      error: (e as Error).message,
+    });
     throw Object.assign(new Error('Incorrect password'), {
       code: 'PASSWORD_INCORRECT',
     });

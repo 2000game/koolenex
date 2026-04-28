@@ -7,7 +7,7 @@ import { parseKnxproj } from '../ets-parser.ts';
 import type { ParsedProject } from '../ets-parser.ts';
 import { saveModelsAndMasterXml, MAX_UPLOAD_BYTES } from './shared.ts';
 import { invalidateGaDptCache } from './bus.ts';
-import { safeError } from '../log.ts';
+import { logger, safeError } from '../log.ts';
 import { validateBody, paramId } from '../validate.ts';
 import type { Project, RunResult } from '../../shared/types.ts';
 
@@ -305,11 +305,24 @@ router.post(
 
     const body = validateBody(req, importBodySchema);
 
+    logger.info('api', 'import: received', {
+      name: req.file.originalname,
+      bytes: req.file.buffer.length,
+      hasPassword: !!body.password,
+    });
+
     let parsed: ParsedProject;
+    const tParse = Date.now();
     try {
       parsed = parseUploadedKnxproj(req, body.password);
+      logger.info('api', 'import: parse ok', { ms: Date.now() - tParse });
     } catch (e) {
       const err = e as ParseError;
+      logger.info('api', 'import: parse failed', {
+        ms: Date.now() - tParse,
+        code: err.code || null,
+        error: err.message,
+      });
       if (err.code === 'PASSWORD_REQUIRED')
         return res.status(422).json({
           error: 'Project is password-protected',
@@ -319,9 +332,10 @@ router.post(
         return res
           .status(422)
           .json({ error: 'Incorrect password', code: 'PASSWORD_INCORRECT' });
+      safeError('ets', 'Parse failed', e);
       return res
         .status(422)
-        .json({ error: safeError('ets', 'Parse failed', e) });
+        .json({ error: 'Parse failed: ' + (err.message || 'unknown error') });
     }
 
     const {
@@ -398,11 +412,25 @@ router.post(
 
     const body = validateBody(req, importBodySchema);
 
+    logger.info('api', 'reimport: received', {
+      pid,
+      name: req.file.originalname,
+      bytes: req.file.buffer.length,
+      hasPassword: !!body.password,
+    });
+
     let parsed: ParsedProject;
+    const tParse = Date.now();
     try {
       parsed = parseUploadedKnxproj(req, body.password);
+      logger.info('api', 'reimport: parse ok', { ms: Date.now() - tParse });
     } catch (e) {
       const err = e as ParseError;
+      logger.info('api', 'reimport: parse failed', {
+        ms: Date.now() - tParse,
+        code: err.code || null,
+        error: err.message,
+      });
       if (err.code === 'PASSWORD_REQUIRED')
         return res.status(422).json({
           error: 'Project is password-protected',
@@ -412,9 +440,10 @@ router.post(
         return res
           .status(422)
           .json({ error: 'Incorrect password', code: 'PASSWORD_INCORRECT' });
+      safeError('ets', 'Reimport failed', e);
       return res
         .status(422)
-        .json({ error: safeError('ets', 'Parse failed', e) });
+        .json({ error: 'Parse failed: ' + (err.message || 'unknown error') });
     }
 
     const {
