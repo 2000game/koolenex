@@ -1,7 +1,10 @@
 SERVER_PID := .server.pid
 CLIENT_PID := .client.pid
 
-kill-tree = pids=$$(pstree -p $(1) 2>/dev/null | grep -oP '\(\K[0-9]+' | tac); kill $$pids 2>/dev/null
+# Portable: walk the descendants of $(1) via pgrep -P, prepending each new
+# child so the final list is children-first. pgrep is on both Linux and BSD;
+# avoids the GNU-only `grep -P` and `tac` used previously.
+kill-tree = pids="$(1)"; q="$(1)"; while [ -n "$$q" ]; do next=""; for p in $$q; do kids=$$(pgrep -P $$p 2>/dev/null || true); for k in $$kids; do pids="$$k $$pids"; next="$$next $$k"; done; done; q="$$next"; done; kill $$pids 2>/dev/null || true
 kill-pid = [ -f $($(1)_PID) ] && { $(call kill-tree,$$(cat $($(1)_PID))); rm -f $($(1)_PID); } || true
 save-pid = echo $$! > $($(1)_PID)
 
