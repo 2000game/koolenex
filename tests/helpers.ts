@@ -69,6 +69,74 @@ export interface TestServer {
 }
 
 /**
+ * Synchronous-feeling import helper for tests: POST the file, then poll the
+ * status endpoint until the job reaches a terminal status. Returns the final
+ * snapshot. Useful since the production endpoint is now async.
+ */
+export async function importProject(
+  baseUrl: string,
+  filePath: string,
+  fileName = 'test.knxproj',
+  password?: string,
+  maxMs = 30_000,
+): Promise<{
+  importId: string;
+  status: 'done' | 'failed';
+  projectId?: number;
+  summary?: {
+    devices: number;
+    groupAddresses: number;
+    comObjects: number;
+    links: number;
+  };
+  error?: string;
+  code?: string;
+}> {
+  const fs = await import('fs');
+  const fd = new FormData();
+  fd.append('file', new Blob([fs.readFileSync(filePath)]), fileName);
+  if (password) fd.append('password', password);
+  const kickoff = await req(baseUrl, 'POST', '/projects/import', fd, true);
+  if (kickoff.status !== 200) {
+    throw new Error(
+      `import kickoff failed: ${kickoff.status} ${JSON.stringify(kickoff.data)}`,
+    );
+  }
+  const importId = (kickoff.data as { importId: string }).importId;
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    const r = await req(baseUrl, 'GET', `/projects/import/${importId}/status`);
+    if (r.status === 200) {
+      const snap = r.data as {
+        importId: string;
+        status: string;
+        projectId?: number;
+        summary?: {
+          devices: number;
+          groupAddresses: number;
+          comObjects: number;
+          links: number;
+        };
+        error?: string;
+        code?: string;
+      };
+      if (snap.status === 'done' || snap.status === 'failed') {
+        return {
+          importId: snap.importId,
+          status: snap.status,
+          projectId: snap.projectId,
+          summary: snap.summary,
+          error: snap.error,
+          code: snap.code,
+        };
+      }
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`import ${importId} did not finish within ${maxMs}ms`);
+}
+
+/**
  * Spin up an Express test server with in-memory SQLite.
  * Call `close()` in your `after()` hook.
  */

@@ -6,7 +6,12 @@
 import { describe, it, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'fs';
-import { createTestServer, req as rawReq, SMOKE_PROJECT } from './helpers.ts';
+import {
+  createTestServer,
+  req as rawReq,
+  importProject,
+  SMOKE_PROJECT,
+} from './helpers.ts';
 import type { TestServer, ReqResult } from './helpers.ts';
 
 let ts: TestServer;
@@ -27,12 +32,11 @@ before(async () => {
   ts = await createTestServer();
   if (!hasFixture) return;
 
-  // Import the smoke test project
-  const fd = new FormData();
-  fd.append('file', new Blob([fs.readFileSync(SMOKE_PROJECT)]), 'test.knxproj');
-  const res = await req('POST', '/projects/import', fd, true);
-  assert.equal(res.status, 200);
-  projectId = (res.data as { projectId: number }).projectId;
+  // Import the smoke test project (now async — poll until done)
+  const result = await importProject(ts.baseUrl, SMOKE_PROJECT);
+  assert.equal(result.status, 'done', `import failed: ${result.error}`);
+  assert(result.projectId, 'import returned no projectId');
+  projectId = result.projectId;
 });
 
 after(() => ts?.close());

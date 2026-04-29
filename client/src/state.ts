@@ -1,6 +1,7 @@
 // ── App state reducer ─────────────────────────────────────────────────────────
 
 import { buildGAMaps } from '../../shared/ga-maps.ts';
+import type { ImportSummary } from './api.ts';
 import type {
   Project,
   Device,
@@ -56,6 +57,33 @@ export interface ScanState {
   progress: ScanProgress | null;
 }
 
+export type ImportClientStatus =
+  | 'idle'
+  | 'uploading'
+  | 'parsing'
+  | 'password-required'
+  | 'done'
+  | 'failed';
+
+export interface ImportState {
+  importId: string | null;
+  mode: 'import' | 'reimport' | null;
+  fileName: string | null;
+  status: ImportClientStatus;
+  projectId: number | null;
+  summary: ImportSummary | null;
+  error: string | null;
+  passwordRetry: boolean;
+}
+
+const IMPORT_LS_KEY = 'knx-active-import';
+const persistImportId = (id: string | null): void => {
+  try {
+    if (id) localStorage.setItem(IMPORT_LS_KEY, id);
+    else localStorage.removeItem(IMPORT_LS_KEY);
+  } catch {}
+};
+
 interface BusStatus {
   connected: boolean;
   host: string | null;
@@ -75,7 +103,19 @@ export interface AppState {
   error: string | null;
   windows: WindowEntry[];
   scan: ScanState;
+  import: ImportState;
 }
+
+const initialImportState: ImportState = {
+  importId: null,
+  mode: null,
+  fileName: null,
+  status: 'idle',
+  projectId: null,
+  summary: null,
+  error: null,
+  passwordRetry: false,
+};
 
 export const initialState: AppState = {
   projects: [],
@@ -87,6 +127,7 @@ export const initialState: AppState = {
   error: null,
   windows: [],
   scan: { results: [], running: false, progress: null },
+  import: initialImportState,
 };
 
 export const GROUP_WTYPES = {
@@ -139,7 +180,40 @@ export type Action =
     }
   | { type: 'SCAN_PROGRESS'; progress: ScanProgress }
   | { type: 'SCAN_DONE'; results: ScanResult[] }
-  | { type: 'SCAN_RESET' };
+  | { type: 'SCAN_RESET' }
+  | { type: 'IMPORT_RESET' }
+  | {
+      type: 'IMPORT_UPLOADING';
+      mode: 'import' | 'reimport';
+      fileName: string;
+    }
+  | {
+      type: 'IMPORT_STARTED';
+      importId: string;
+      mode: 'import' | 'reimport';
+      fileName: string;
+    }
+  | {
+      type: 'IMPORT_PASSWORD_REQUIRED';
+      importId: string;
+      retry: boolean;
+    }
+  | {
+      type: 'IMPORT_PARSING';
+      importId: string;
+    }
+  | {
+      type: 'IMPORT_DONE';
+      importId: string;
+      projectId: number;
+      summary: ImportSummary;
+    }
+  | {
+      type: 'IMPORT_FAILED';
+      importId: string;
+      error: string;
+      code?: string;
+    };
 
 export function reducer(state: AppState, action: Action): AppState {
   switch (action.type) {
@@ -354,6 +428,74 @@ export function reducer(state: AppState, action: Action): AppState {
       return {
         ...state,
         scan: { results: [], running: false, progress: null },
+      };
+    case 'IMPORT_RESET':
+      persistImportId(null);
+      return { ...state, import: initialImportState };
+    case 'IMPORT_UPLOADING':
+      return {
+        ...state,
+        import: {
+          ...initialImportState,
+          mode: action.mode,
+          fileName: action.fileName,
+          status: 'uploading',
+        },
+      };
+    case 'IMPORT_STARTED':
+      persistImportId(action.importId);
+      return {
+        ...state,
+        import: {
+          ...state.import,
+          importId: action.importId,
+          mode: action.mode,
+          fileName: action.fileName || state.import.fileName,
+          status: 'parsing',
+          error: null,
+          passwordRetry: false,
+        },
+      };
+    case 'IMPORT_PARSING':
+      if (state.import.importId !== action.importId) return state;
+      return {
+        ...state,
+        import: { ...state.import, status: 'parsing', error: null },
+      };
+    case 'IMPORT_PASSWORD_REQUIRED':
+      // Accept the event even if importId doesn't match — recovery flow
+      return {
+        ...state,
+        import: {
+          ...state.import,
+          importId: action.importId,
+          status: 'password-required',
+          passwordRetry: action.retry,
+        },
+      };
+    case 'IMPORT_DONE':
+      persistImportId(null);
+      return {
+        ...state,
+        import: {
+          ...state.import,
+          importId: action.importId,
+          status: 'done',
+          projectId: action.projectId,
+          summary: action.summary,
+          error: null,
+        },
+      };
+    case 'IMPORT_FAILED':
+      persistImportId(null);
+      return {
+        ...state,
+        import: {
+          ...state.import,
+          importId: action.importId,
+          status: 'failed',
+          error: action.error,
+        },
       };
     default:
       return state;

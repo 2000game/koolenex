@@ -780,3 +780,8 @@ export function setBus(b: KnxBusManager): void {
   bus = b;
   wireBusEvents();
 }
+
+/** Lazy accessor for the bus instance. Returns null until setBus() runs. */
+export function getBus(): KnxBusManager | null {
+  return bus;
+}

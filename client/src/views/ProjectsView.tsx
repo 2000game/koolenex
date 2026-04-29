@@ -1,4 +1,4 @@
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Btn, Spinner } from '../primitives.tsx';
 import { api } from '../api.ts';
@@ -12,11 +12,26 @@ interface ProjectsViewProps {
 export function ProjectsView({ state, dispatch }: ProjectsViewProps) {
   const navigate = useNavigate();
   const [newName, setNewName] = useState('');
-  const [importing, setImporting] = useState(false);
-  const [importResult, setImportResult] = useState<any>(null);
-  const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [importPassword, setImportPassword] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
+  const importStateRef = useRef(state.import);
+  importStateRef.current = state.import;
+
+  const importStatus = state.import.status as
+    | 'idle'
+    | 'uploading'
+    | 'parsing'
+    | 'password-required'
+    | 'done'
+    | 'failed';
+  const importBusy = importStatus === 'uploading' || importStatus === 'parsing';
+  const importMode = state.import.mode as 'import' | 'reimport' | null;
+  const showImportFeedback = importMode === 'import' && importStatus !== 'idle';
+
+  // Reset password field whenever the server says password-required
+  useEffect(() => {
+    if (importStatus === 'password-required') setImportPassword('');
+  }, [importStatus, state.import.importId]);
 
   const loadProject = async (id: any) => {
     dispatch({ type: 'SET_LOADING', loading: true });
@@ -50,63 +65,59 @@ export function ProjectsView({ state, dispatch }: ProjectsViewProps) {
     });
   };
 
-  const doImport = async (file: File, password: string | null = null) => {
-    const fd = new FormData();
-    fd.append('file', file);
-    if (password) fd.append('password', password);
-    const result = await api.importETS(fd);
-    setImportResult({
-      ok: true,
-      summary: result.summary,
-      projectId: result.projectId,
-      name: result.data?.project?.name,
-    });
-    const projs = await api.listProjects();
-    dispatch({ type: 'SET_PROJECTS', projects: projs });
-    setPendingFile(null);
-    setImportPassword('');
-  };
-
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
-    setImporting(true);
-    setImportResult(null);
-    try {
-      await doImport(file);
-    } catch (err: any) {
-      if (err.code === 'PASSWORD_REQUIRED') {
-        setPendingFile(file);
-        setImportResult({ ok: false, passwordRequired: true });
-      } else {
-        setImportResult({ ok: false, error: err.message });
-      }
-    }
-    setImporting(false);
     e.target.value = '';
+    if (!file) return;
+    dispatch({
+      type: 'IMPORT_UPLOADING',
+      mode: 'import',
+      fileName: file.name,
+    });
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+      const result = await api.importETS(fd);
+      // The server has registered the job; the WS `import:started` event
+      // will arrive momentarily and flip our state to `parsing`. Dispatch
+      // IMPORT_STARTED locally too so we don't briefly show the upload state
+      // if the WS lags.
+      dispatch({
+        type: 'IMPORT_STARTED',
+        importId: result.importId,
+        mode: 'import',
+        fileName: file.name,
+      });
+    } catch (err: any) {
+      dispatch({
+        type: 'IMPORT_FAILED',
+        importId: importStateRef.current.importId || '',
+        error: err.message || 'Upload failed',
+        code: err.code,
+      });
+    }
   };
 
-  const handleImportWithPassword = async () => {
-    if (!pendingFile || !importPassword) return;
-    setImporting(true);
+  const submitPassword = async () => {
+    const importId = state.import.importId;
+    if (!importId || !importPassword) return;
     try {
-      await doImport(pendingFile, importPassword);
+      await api.submitImportPassword(importId, importPassword);
+      dispatch({ type: 'IMPORT_PARSING', importId });
     } catch (err: any) {
-      if (
-        err.code === 'PASSWORD_INCORRECT' ||
-        err.code === 'PASSWORD_REQUIRED'
-      ) {
-        setImportResult({
-          ok: false,
-          passwordRequired: true,
-          error: 'Incorrect password — try again',
-        });
-      } else {
-        setImportResult({ ok: false, error: err.message });
-      }
+      dispatch({
+        type: 'IMPORT_FAILED',
+        importId,
+        error: err.message || 'Failed to submit password',
+        code: err.code,
+      });
     }
-    setImporting(false);
   };
+
+  const importedProject =
+    state.import.projectId != null
+      ? state.projects.find((p: any) => p.id === state.import.projectId)
+      : null;
 
   return (
     <div className={`fi ${styles.root}`}>
@@ -128,81 +139,74 @@ export function ProjectsView({ state, dispatch }: ProjectsViewProps) {
             onChange={handleImport}
             className={styles.hidden}
           />
-          <Btn onClick={() => fileRef.current?.click()} disabled={importing}>
-            {importing ? (
+          <Btn
+            onClick={() => fileRef.current?.click()}
+            disabled={importBusy || importStatus === 'password-required'}
+          >
+            {importBusy ? (
               <>
-                <Spinner /> Parsing…
+                <Spinner />{' '}
+                {importStatus === 'uploading' ? 'Uploading…' : 'Parsing…'}
               </>
             ) : (
               '⊠ Import .knxproj'
             )}
           </Btn>
-          {importResult && (
-            <div
-              className={
-                importResult.ok
-                  ? styles.importResultOk
-                  : importResult.passwordRequired
-                    ? styles.importResultPassword
-                    : styles.importResultError
-              }
-            >
-              {importResult.ok ? (
-                <>
-                  <div className={styles.importSuccess}>
-                    ✓ Imported: {importResult.name}
-                  </div>
-                  <div className={styles.importSummary}>
-                    {importResult.summary.devices} devices ·{' '}
-                    {importResult.summary.groupAddresses} GAs ·{' '}
-                    {importResult.summary.comObjects} group objects ·{' '}
-                    {importResult.summary.links} links
-                  </div>
-                  <Btn
-                    onClick={() => loadProject(importResult.projectId)}
-                    className={styles.openBtn}
-                  >
-                    Open Project →
-                  </Btn>
-                </>
-              ) : importResult.passwordRequired ? (
-                <>
-                  <div className={styles.passwordTitle}>
-                    ⚿ Password protected
-                  </div>
-                  {importResult.error && (
-                    <div className={styles.passwordError}>
-                      {importResult.error}
-                    </div>
-                  )}
-                  <div className={styles.passwordRow}>
-                    <input
-                      type="password"
-                      value={importPassword}
-                      onChange={(e) => setImportPassword(e.target.value)}
-                      onKeyDown={(e) =>
-                        e.key === 'Enter' && handleImportWithPassword()
-                      }
-                      placeholder="Project password…"
-                      autoFocus
-                      className={styles.passwordInput}
-                    />
-                    <Btn
-                      onClick={handleImportWithPassword}
-                      disabled={!importPassword || importing}
-                    >
-                      {importing ? <Spinner /> : 'Unlock'}
-                    </Btn>
-                  </div>
-                </>
-              ) : (
-                <>
-                  <div className={styles.importError}>✗ Import failed</div>
-                  <div className={styles.importErrorDetail}>
-                    {importResult.error}
-                  </div>
-                </>
+          {showImportFeedback && importStatus === 'done' && (
+            <div className={styles.importResultOk}>
+              <div className={styles.importSuccess}>
+                ✓ Imported:{' '}
+                {importedProject?.name || state.import.fileName || 'Project'}
+              </div>
+              {state.import.summary && (
+                <div className={styles.importSummary}>
+                  {state.import.summary.devices} devices ·{' '}
+                  {state.import.summary.groupAddresses} GAs ·{' '}
+                  {state.import.summary.comObjects} group objects ·{' '}
+                  {state.import.summary.links} links
+                </div>
               )}
+              <Btn
+                onClick={() => loadProject(state.import.projectId)}
+                className={styles.openBtn}
+              >
+                Open Project →
+              </Btn>
+            </div>
+          )}
+          {showImportFeedback && importStatus === 'password-required' && (
+            <div className={styles.importResultPassword}>
+              <div className={styles.passwordTitle}>⚿ Password protected</div>
+              {state.import.passwordRetry && (
+                <div className={styles.passwordError}>
+                  Incorrect password — try again
+                </div>
+              )}
+              <div className={styles.passwordRow}>
+                <input
+                  type="password"
+                  value={importPassword}
+                  onChange={(e) => setImportPassword(e.target.value)}
+                  onKeyDown={(e) => e.key === 'Enter' && submitPassword()}
+                  placeholder="Project password…"
+                  autoFocus
+                  className={styles.passwordInput}
+                />
+                <Btn
+                  onClick={submitPassword}
+                  disabled={!importPassword || importBusy}
+                >
+                  Unlock
+                </Btn>
+              </div>
+            </div>
+          )}
+          {showImportFeedback && importStatus === 'failed' && (
+            <div className={styles.importResultError}>
+              <div className={styles.importError}>✗ Import failed</div>
+              <div className={styles.importErrorDetail}>
+                {state.import.error}
+              </div>
             </div>
           )}
         </div>
@@ -257,7 +261,7 @@ export function ProjectsView({ state, dispatch }: ProjectsViewProps) {
             ))}
           </div>
         )}
-        {state.projects.length === 0 && !importing && (
+        {state.projects.length === 0 && !importBusy && (
           <div className={styles.emptyMsg}>
             No projects yet. Import a .knxproj or create a blank project.
           </div>

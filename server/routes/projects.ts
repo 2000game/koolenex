@@ -7,6 +7,8 @@ import { parseKnxproj } from '../ets-parser.ts';
 import type { ParsedProject } from '../ets-parser.ts';
 import { saveModelsAndMasterXml, MAX_UPLOAD_BYTES } from './shared.ts';
 import { invalidateGaDptCache } from './bus.ts';
+import * as importJobs from './import-jobs.ts';
+import type { ImportJob } from './import-jobs.ts';
 import { logger, safeError } from '../log.ts';
 import { validateBody, paramId } from '../validate.ts';
 import type { Project, RunResult } from '../../shared/types.ts';
@@ -210,13 +212,136 @@ function insertParsedData(
 }
 
 const importBodySchema = z.object({ password: z.string().optional() });
+const passwordBodySchema = z.object({ password: z.string().min(1) });
 
-function parseUploadedKnxproj(
-  req: Request,
-  password: string | undefined,
-): ParsedProject {
-  const file = req.file as Express.Multer.File;
-  return parseKnxproj(file.buffer, password || null);
+/**
+ * Run a parse + DB-insert (or reimport) for an already-registered job.
+ * Drives the job through password-required → parsing → done|failed transitions.
+ * Called via setImmediate so the HTTP response has already been sent.
+ */
+async function runImportJob(job: ImportJob): Promise<void> {
+  const buf = job.fileBuffer;
+  if (!buf) {
+    importJobs.setTerminal(job.importId, {
+      status: 'failed',
+      error: 'Upload buffer no longer available',
+      code: 'INTERNAL',
+    });
+    return;
+  }
+
+  let parsed: ParsedProject;
+  const tParse = Date.now();
+  try {
+    parsed = parseKnxproj(buf, job.password || null);
+    logger.info('import', 'parse ok', {
+      importId: job.importId,
+      ms: Date.now() - tParse,
+    });
+  } catch (e) {
+    const err = e as ParseError;
+    logger.info('import', 'parse failed', {
+      importId: job.importId,
+      ms: Date.now() - tParse,
+      code: err.code || null,
+      error: err.message,
+    });
+    if (err.code === 'PASSWORD_REQUIRED' || err.code === 'PASSWORD_INCORRECT') {
+      const j = importJobs.getJob(job.importId);
+      if (j) j.passwordRetry = err.code === 'PASSWORD_INCORRECT';
+      importJobs.setStatus(job.importId, { status: 'password-required' });
+      return;
+    }
+    safeError('ets', `${job.mode} parse failed`, e);
+    importJobs.setTerminal(job.importId, {
+      status: 'failed',
+      error: err.message || 'Parse failed',
+      code: 'PARSE_FAILED',
+    });
+    return;
+  }
+
+  try {
+    const {
+      projectName,
+      devices,
+      groupAddresses,
+      comObjects,
+      links,
+      paramModels,
+      thumbnail,
+      projectInfo,
+      knxMasterXml,
+    } = parsed;
+
+    let projectId: number;
+    if (job.mode === 'import') {
+      projectId = db.transaction(({ run }: db.TransactionHelpers) => {
+        const { lastInsertRowid: pid } = run(
+          'INSERT INTO projects (name, file_name, thumbnail, project_info) VALUES (?,?,?,?)',
+          [
+            projectName,
+            job.fileName,
+            thumbnail || '',
+            JSON.stringify(projectInfo || {}),
+          ],
+        );
+        insertParsedData(run, pid as number, parsed);
+        return pid as number;
+      });
+    } else {
+      projectId = job.reimportProjectId!;
+      db.transaction(({ run }: db.TransactionHelpers) => {
+        run('DELETE FROM com_objects WHERE project_id=?', [projectId]);
+        run('DELETE FROM group_addresses WHERE project_id=?', [projectId]);
+        run('DELETE FROM ga_group_names WHERE project_id=?', [projectId]);
+        run('DELETE FROM devices WHERE project_id=?', [projectId]);
+        run('DELETE FROM topology WHERE project_id=?', [projectId]);
+        run('DELETE FROM catalog_sections WHERE project_id=?', [projectId]);
+        run('DELETE FROM catalog_items WHERE project_id=?', [projectId]);
+        run('DELETE FROM spaces WHERE project_id=?', [projectId]);
+        run(
+          "UPDATE projects SET name=?, file_name=?, thumbnail=?, project_info=?, updated_at=datetime('now') WHERE id=?",
+          [
+            projectName,
+            job.fileName,
+            thumbnail || '',
+            JSON.stringify(projectInfo || {}),
+            projectId,
+          ],
+        );
+        insertParsedData(run, projectId, parsed);
+      });
+    }
+
+    saveModelsAndMasterXml(paramModels, knxMasterXml, projectId);
+    db.audit(
+      projectId,
+      job.mode,
+      'project',
+      job.fileName,
+      `${job.mode === 'import' ? 'Imported' : 'Reimported'} ${devices.length} devices, ${groupAddresses.length} group addresses, ${comObjects.length} com objects`,
+    );
+    invalidateGaDptCache();
+
+    importJobs.setTerminal(job.importId, {
+      status: 'done',
+      projectId,
+      summary: {
+        devices: devices.length,
+        groupAddresses: groupAddresses.length,
+        comObjects: comObjects.length,
+        links: links.length,
+      },
+    });
+  } catch (e) {
+    safeError('ets', `${job.mode} failed`, e);
+    importJobs.setTerminal(job.importId, {
+      status: 'failed',
+      error: (e as Error).message || `${job.mode} failed`,
+      code: 'INTERNAL',
+    });
+  }
 }
 
 // ── Projects ──────────────────────────────────────────────────────────────────
@@ -294,7 +419,12 @@ router.delete('/projects/:id', (req: Request, res: Response) => {
   res.json({ ok: true });
 });
 
-// ── ETS6 Import ───────────────────────────────────────────────────────────────
+// ── ETS6 Import (async) ───────────────────────────────────────────────────────
+// The HTTP response returns immediately with an importId. Parse + DB insert
+// run in the background; the client tracks completion via WebSocket
+// (`import:done` / `import:failed` / `import:password-required`) or by polling
+// GET /projects/import/:importId/status.
+
 router.post(
   '/projects/import',
   upload.single('file'),
@@ -305,99 +435,36 @@ router.post(
 
     const body = validateBody(req, importBodySchema);
 
+    const activeId = importJobs.getActiveImportId();
+    if (activeId) {
+      return res.status(409).json({
+        error: 'An import is already in progress',
+        code: 'IMPORT_BUSY',
+        activeImportId: activeId,
+      });
+    }
+
+    const job = importJobs.createJob({
+      mode: 'import',
+      fileName: req.file.originalname,
+      fileBuffer: req.file.buffer,
+      password: body.password,
+    });
+
     logger.info('api', 'import: received', {
-      name: req.file.originalname,
+      importId: job.importId,
+      name: job.fileName,
       bytes: req.file.buffer.length,
       hasPassword: !!body.password,
     });
 
-    let parsed: ParsedProject;
-    const tParse = Date.now();
-    try {
-      parsed = parseUploadedKnxproj(req, body.password);
-      logger.info('api', 'import: parse ok', { ms: Date.now() - tParse });
-    } catch (e) {
-      const err = e as ParseError;
-      logger.info('api', 'import: parse failed', {
-        ms: Date.now() - tParse,
-        code: err.code || null,
-        error: err.message,
-      });
-      if (err.code === 'PASSWORD_REQUIRED')
-        return res.status(422).json({
-          error: 'Project is password-protected',
-          code: 'PASSWORD_REQUIRED',
-        });
-      if (err.code === 'PASSWORD_INCORRECT')
-        return res
-          .status(422)
-          .json({ error: 'Incorrect password', code: 'PASSWORD_INCORRECT' });
-      safeError('ets', 'Parse failed', e);
-      return res
-        .status(422)
-        .json({ error: 'Parse failed: ' + (err.message || 'unknown error') });
-    }
-
-    const {
-      projectName,
-      devices,
-      groupAddresses,
-      comObjects,
-      links,
-      paramModels,
-      thumbnail,
-      projectInfo,
-      knxMasterXml,
-    } = parsed;
-
-    try {
-      const projectId = db.transaction(({ run }: db.TransactionHelpers) => {
-        const { lastInsertRowid: pid } = run(
-          'INSERT INTO projects (name, file_name, thumbnail, project_info) VALUES (?,?,?,?)',
-          [
-            projectName,
-            req.file!.originalname,
-            thumbnail || '',
-            JSON.stringify(projectInfo || {}),
-          ],
-        );
-
-        insertParsedData(run, pid as number, parsed);
-
-        return pid as number;
-      });
-
-      const data = db.getProjectFull(projectId);
-
-      saveModelsAndMasterXml(paramModels, knxMasterXml, projectId);
-
-      db.audit(
-        projectId,
-        'import',
-        'project',
-        req.file!.originalname,
-        `Imported ${devices.length} devices, ${groupAddresses.length} group addresses, ${comObjects.length} com objects`,
-      );
-
-      invalidateGaDptCache();
-      res.json({
-        ok: true,
-        projectId,
-        summary: {
-          devices: devices.length,
-          groupAddresses: groupAddresses.length,
-          comObjects: comObjects.length,
-          links: links.length,
-        },
-        data,
-      });
-    } catch (e) {
-      res.status(500).json({ error: safeError('ets', 'Import failed', e) });
-    }
+    res.json({ ok: true, importId: job.importId });
+    setImmediate(() => {
+      void runImportJob(job);
+    });
   },
 );
 
-// ── ETS6 Reimport (update existing project in-place) ──────────────────────────
 router.post(
   '/projects/:id/reimport',
   upload.single('file'),
@@ -412,103 +479,72 @@ router.post(
 
     const body = validateBody(req, importBodySchema);
 
+    const activeId = importJobs.getActiveImportId();
+    if (activeId) {
+      return res.status(409).json({
+        error: 'An import is already in progress',
+        code: 'IMPORT_BUSY',
+        activeImportId: activeId,
+      });
+    }
+
+    const job = importJobs.createJob({
+      mode: 'reimport',
+      reimportProjectId: pid,
+      fileName: req.file.originalname,
+      fileBuffer: req.file.buffer,
+      password: body.password,
+    });
+
     logger.info('api', 'reimport: received', {
+      importId: job.importId,
       pid,
-      name: req.file.originalname,
+      name: job.fileName,
       bytes: req.file.buffer.length,
       hasPassword: !!body.password,
     });
 
-    let parsed: ParsedProject;
-    const tParse = Date.now();
-    try {
-      parsed = parseUploadedKnxproj(req, body.password);
-      logger.info('api', 'reimport: parse ok', { ms: Date.now() - tParse });
-    } catch (e) {
-      const err = e as ParseError;
-      logger.info('api', 'reimport: parse failed', {
-        ms: Date.now() - tParse,
-        code: err.code || null,
-        error: err.message,
-      });
-      if (err.code === 'PASSWORD_REQUIRED')
-        return res.status(422).json({
-          error: 'Project is password-protected',
-          code: 'PASSWORD_REQUIRED',
-        });
-      if (err.code === 'PASSWORD_INCORRECT')
-        return res
-          .status(422)
-          .json({ error: 'Incorrect password', code: 'PASSWORD_INCORRECT' });
-      safeError('ets', 'Reimport failed', e);
+    res.json({ ok: true, importId: job.importId });
+    setImmediate(() => {
+      void runImportJob(job);
+    });
+  },
+);
+
+// ── Import job control (password retry, status polling) ────────────────────
+
+router.post(
+  '/projects/import/:importId/password',
+  (req: Request, res: Response) => {
+    const importId = String(req.params.importId);
+    const job = importJobs.getJob(importId);
+    if (!job) return res.status(404).json({ error: 'Import job not found' });
+    if (job.status !== 'password-required')
+      return res.status(409).json({ error: 'Job not awaiting password' });
+    if (!job.fileBuffer)
       return res
-        .status(422)
-        .json({ error: 'Parse failed: ' + (err.message || 'unknown error') });
-    }
+        .status(410)
+        .json({ error: 'Upload expired, please re-upload' });
 
-    const {
-      projectName,
-      devices,
-      groupAddresses,
-      comObjects,
-      links,
-      paramModels,
-      thumbnail,
-      projectInfo,
-      knxMasterXml,
-    } = parsed;
+    const body = validateBody(req, passwordBodySchema);
+    job.password = body.password;
+    importJobs.setStatus(importId, { status: 'parsing' });
 
-    try {
-      db.transaction(({ run }: db.TransactionHelpers) => {
-        // Clear existing data for this project
-        run('DELETE FROM com_objects WHERE project_id=?', [pid]);
-        run('DELETE FROM group_addresses WHERE project_id=?', [pid]);
-        run('DELETE FROM ga_group_names WHERE project_id=?', [pid]);
-        run('DELETE FROM devices WHERE project_id=?', [pid]);
-        run('DELETE FROM topology WHERE project_id=?', [pid]);
-        run('DELETE FROM catalog_sections WHERE project_id=?', [pid]);
-        run('DELETE FROM catalog_items WHERE project_id=?', [pid]);
-        run('DELETE FROM spaces WHERE project_id=?', [pid]);
-        run(
-          "UPDATE projects SET name=?, file_name=?, thumbnail=?, project_info=?, updated_at=datetime('now') WHERE id=?",
-          [
-            projectName,
-            req.file!.originalname,
-            thumbnail || '',
-            JSON.stringify(projectInfo || {}),
-            pid,
-          ],
-        );
+    logger.info('api', 'import: password submitted', { importId });
 
-        insertParsedData(run, pid, parsed);
-      });
+    res.json({ ok: true });
+    setImmediate(() => {
+      void runImportJob(job);
+    });
+  },
+);
 
-      const data = db.getProjectFull(pid);
-
-      saveModelsAndMasterXml(paramModels, knxMasterXml, pid);
-
-      db.audit(
-        pid,
-        'reimport',
-        'project',
-        req.file!.originalname,
-        `Reimported ${devices.length} devices, ${groupAddresses.length} group addresses, ${comObjects.length} com objects`,
-      );
-
-      invalidateGaDptCache();
-      res.json({
-        ok: true,
-        projectId: pid,
-        summary: {
-          devices: devices.length,
-          groupAddresses: groupAddresses.length,
-          comObjects: comObjects.length,
-          links: links.length,
-        },
-        data,
-      });
-    } catch (e) {
-      res.status(500).json({ error: safeError('ets', 'Reimport failed', e) });
-    }
+router.get(
+  '/projects/import/:importId/status',
+  (req: Request, res: Response) => {
+    const importId = String(req.params.importId);
+    const job = importJobs.getJob(importId);
+    if (!job) return res.status(404).json({ error: 'Import job not found' });
+    res.json(importJobs.snapshot(job));
   },
 );

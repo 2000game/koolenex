@@ -53,6 +53,34 @@ async function req(
   return { status: res.status, data, headers: res.headers };
 }
 
+/**
+ * Poll GET /projects/import/:importId/status until the job reaches a terminal
+ * status (`done` or `failed`) or until `password-required` if `awaitPassword`
+ * is true. Returns the snapshot.
+ */
+async function pollImportStatus(
+  importId: string,
+  opts: { awaitPassword?: boolean; maxMs?: number } = {},
+): Promise<any> {
+  const deadline = Date.now() + (opts.maxMs ?? 30_000);
+  while (Date.now() < deadline) {
+    const { status, data } = await req(
+      'GET',
+      `/projects/import/${importId}/status`,
+    );
+    if (status !== 200) throw new Error(`status poll: HTTP ${status}`);
+    if (
+      data.status === 'done' ||
+      data.status === 'failed' ||
+      (opts.awaitPassword && data.status === 'password-required')
+    ) {
+      return data;
+    }
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error(`import ${importId} did not reach terminal status`);
+}
+
 before(async () => {
   db = await import('../server/db.ts');
   await db.init({ inMemory: true });
@@ -538,17 +566,24 @@ if (fs.existsSync(SMOKE_PROJECT_PW)) {
 describe('Smoke: API import', () => {
   let pid;
 
-  it('imports via POST /projects/import', async () => {
+  it('imports via POST /projects/import (async)', async () => {
     const buf = fs.readFileSync(SMOKE_PROJECT);
     const form = new FormData();
     form.append('file', new Blob([buf]), 'smoke-test.knxproj');
     const { status, data } = await req('POST', '/projects/import', form, true);
     assert.equal(status, 200, `import failed: ${JSON.stringify(data)}`);
-    assert(data.projectId);
-    assert.equal(data.summary.devices, 6);
-    assert.equal(data.summary.groupAddresses, 4);
-    assert.equal(data.summary.comObjects, 38);
-    pid = data.projectId;
+    assert(typeof data.importId === 'string', 'importId returned');
+    const snap = await pollImportStatus(data.importId);
+    assert.equal(
+      snap.status,
+      'done',
+      `import not done: ${JSON.stringify(snap)}`,
+    );
+    assert(snap.projectId);
+    assert.equal(snap.summary.devices, 6);
+    assert.equal(snap.summary.groupAddresses, 4);
+    assert.equal(snap.summary.comObjects, 38);
+    pid = snap.projectId;
   });
 
   it('GET /projects/:id returns correct counts', async () => {
@@ -625,9 +660,17 @@ describe('Smoke: API import', () => {
       true,
     );
     assert.equal(status, 200, `reimport failed: ${JSON.stringify(data)}`);
-    assert.equal(data.summary.devices, 6);
-    assert.equal(data.summary.groupAddresses, 4);
-    assert.equal(data.summary.comObjects, 38);
+    assert(typeof data.importId === 'string', 'reimport returns importId');
+    const snap = await pollImportStatus(data.importId);
+    assert.equal(
+      snap.status,
+      'done',
+      `reimport not done: ${JSON.stringify(snap)}`,
+    );
+    assert.equal(snap.projectId, pid);
+    assert.equal(snap.summary.devices, 6);
+    assert.equal(snap.summary.groupAddresses, 4);
+    assert.equal(snap.summary.comObjects, 38);
   });
 
   it('cleanup — delete project', async () => {
@@ -672,7 +715,7 @@ describe('Import/Reimport Error Paths', () => {
     assert.equal(data.error, 'File must be a .knxproj file');
   });
 
-  it('POST /import with corrupt .knxproj returns 422', async () => {
+  it('POST /import with corrupt .knxproj surfaces failure via /status', async () => {
     const form = new FormData();
     form.append(
       'file',
@@ -680,11 +723,14 @@ describe('Import/Reimport Error Paths', () => {
       'corrupt.knxproj',
     );
     const { status, data } = await req('POST', '/projects/import', form, true);
-    assert.equal(status, 422);
-    assert.match(data.error, /^Parse failed: /);
+    assert.equal(status, 200);
+    assert(typeof data.importId === 'string');
+    const snap = await pollImportStatus(data.importId);
+    assert.equal(snap.status, 'failed');
+    assert.equal(snap.code, 'PARSE_FAILED');
   });
 
-  it('POST /import with binary (non-XML, non-encrypted) buffer returns 422', async () => {
+  it('POST /import with binary buffer surfaces failure via /status', async () => {
     const form = new FormData();
     form.append(
       'file',
@@ -692,7 +738,10 @@ describe('Import/Reimport Error Paths', () => {
       'binary.knxproj',
     );
     const { status, data } = await req('POST', '/projects/import', form, true);
-    assert.equal(status, 422);
+    assert.equal(status, 200);
+    assert(typeof data.importId === 'string');
+    const snap = await pollImportStatus(data.importId);
+    assert.equal(snap.status, 'failed');
   });
 
   it('POST /reimport with no file returns 400', async () => {
@@ -741,7 +790,7 @@ describe('Import/Reimport Error Paths', () => {
     assert.equal(status, 404);
   });
 
-  it('POST /reimport with corrupt .knxproj returns 422', async () => {
+  it('POST /reimport with corrupt .knxproj surfaces failure via /status', async () => {
     const { data: proj } = await req('POST', '/projects', {
       name: 'Reimport Error Test',
     });
@@ -753,7 +802,11 @@ describe('Import/Reimport Error Paths', () => {
       form,
       true,
     );
-    assert.equal(status, 422);
+    assert.equal(status, 200);
+    assert(typeof data.importId === 'string');
+    const snap = await pollImportStatus(data.importId);
+    assert.equal(snap.status, 'failed');
+    assert.equal(snap.code, 'PARSE_FAILED');
     await req('DELETE', `/projects/${proj.id}`);
   });
 });

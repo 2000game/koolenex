@@ -25,16 +25,34 @@ interface BusStatusResponse {
   path?: string;
 }
 
-interface ImportResult {
-  ok: boolean;
-  projectId: number;
-  summary: {
-    devices: number;
-    groupAddresses: number;
-    comObjects: number;
-    links: number;
-  };
-  data: ProjectFull;
+export interface ImportSummary {
+  devices: number;
+  groupAddresses: number;
+  comObjects: number;
+  links: number;
+}
+
+interface ImportKickoffResult {
+  ok: true;
+  importId: string;
+}
+
+export type ImportJobStatus =
+  | 'parsing'
+  | 'password-required'
+  | 'done'
+  | 'failed';
+
+export interface ImportStatusSnapshot {
+  importId: string;
+  mode: 'import' | 'reimport';
+  fileName: string;
+  status: ImportJobStatus;
+  projectId?: number;
+  summary?: ImportSummary;
+  error?: string;
+  code?: string;
+  passwordRetry?: boolean;
 }
 
 const BASE = '/api';
@@ -87,9 +105,20 @@ export const api = {
   deleteProject: (id: number) =>
     req<{ ok: boolean }>('DELETE', `/projects/${id}`),
   importETS: (formData: FormData) =>
-    req<ImportResult>('POST', '/projects/import', formData, true),
+    req<ImportKickoffResult>('POST', '/projects/import', formData, true),
   reimportETS: (id: number, formData: FormData) =>
-    req<ImportResult>('POST', `/projects/${id}/reimport`, formData, true),
+    req<ImportKickoffResult>(
+      'POST',
+      `/projects/${id}/reimport`,
+      formData,
+      true,
+    ),
+  submitImportPassword: (importId: string, password: string) =>
+    req<{ ok: true }>('POST', `/projects/import/${importId}/password`, {
+      password,
+    }),
+  getImportStatus: (importId: string) =>
+    req<ImportStatusSnapshot>('GET', `/projects/import/${importId}/status`),
 
   // Devices
   listDevices: (pid: number) =>

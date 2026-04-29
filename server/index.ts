@@ -21,6 +21,10 @@ async function start(): Promise<void> {
   const { router: routes } = await import('./routes/index.ts');
   routes.setBus(bus);
 
+  // Periodic sweep of stale import jobs (TTL eviction)
+  const importJobs = await import('./routes/import-jobs.ts');
+  importJobs.startSweeper();
+
   const app = express();
   app.use(
     CORS_OPEN

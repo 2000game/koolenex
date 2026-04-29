@@ -192,9 +192,94 @@ export default function App() {
         });
       } else if (msg.type === 'scan:error') {
         dispatch({ type: 'SCAN_RESET' });
+      } else if (msg.type === 'import:started') {
+        dispatch({
+          type: 'IMPORT_STARTED',
+          importId: msg.importId as string,
+          mode: msg.mode as 'import' | 'reimport',
+          fileName: (msg.fileName as string) || '',
+        });
+      } else if (msg.type === 'import:password-required') {
+        dispatch({
+          type: 'IMPORT_PASSWORD_REQUIRED',
+          importId: msg.importId as string,
+          retry: !!msg.retry,
+        });
+      } else if (msg.type === 'import:done') {
+        dispatch({
+          type: 'IMPORT_DONE',
+          importId: msg.importId as string,
+          projectId: msg.projectId as number,
+          summary: msg.summary as {
+            devices: number;
+            groupAddresses: number;
+            comObjects: number;
+            links: number;
+          },
+        });
+        api
+          .listProjects()
+          .then((projects) => dispatch({ type: 'SET_PROJECTS', projects }))
+          .catch(() => {});
+      } else if (msg.type === 'import:failed') {
+        dispatch({
+          type: 'IMPORT_FAILED',
+          importId: msg.importId as string,
+          error: (msg.error as string) || 'Import failed',
+          code: msg.code as string | undefined,
+        });
       }
     });
     wsRef.current = ws;
+
+    // Re-attach to an in-flight import if the user refreshed mid-parse.
+    const savedImportId = (() => {
+      try {
+        return localStorage.getItem('knx-active-import');
+      } catch {
+        return null;
+      }
+    })();
+    if (savedImportId) {
+      api
+        .getImportStatus(savedImportId)
+        .then((s) => {
+          if (s.status === 'done' && s.projectId && s.summary) {
+            dispatch({
+              type: 'IMPORT_DONE',
+              importId: s.importId,
+              projectId: s.projectId,
+              summary: s.summary,
+            });
+          } else if (s.status === 'failed') {
+            dispatch({
+              type: 'IMPORT_FAILED',
+              importId: s.importId,
+              error: s.error || 'Import failed',
+              code: s.code,
+            });
+          } else if (s.status === 'password-required') {
+            dispatch({
+              type: 'IMPORT_PASSWORD_REQUIRED',
+              importId: s.importId,
+              retry: !!s.passwordRetry,
+            });
+          } else if (s.status === 'parsing') {
+            dispatch({
+              type: 'IMPORT_STARTED',
+              importId: s.importId,
+              mode: s.mode,
+              fileName: s.fileName,
+            });
+          }
+        })
+        .catch(() => {
+          try {
+            localStorage.removeItem('knx-active-import');
+          } catch {}
+        });
+    }
+
     return () => ws.close();
   }, []);
 

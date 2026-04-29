@@ -17,7 +17,8 @@ import {
   IconFloorPlan,
   IconCatalog,
 } from './icons.tsx';
-import { Spinner, Toast } from './primitives.tsx';
+import { Spinner, Toast, Btn } from './primitives.tsx';
+import primStyles from './primitives.module.css';
 import { buildSpaceMap, spacePath as spacePathFn } from './hooks/spaces.ts';
 import { GlobalSearch } from './search.tsx';
 
@@ -148,30 +149,100 @@ export function AppShell(props: AppShellProps) {
   const projectId = state.activeProjectId;
 
   const reimportRef = useRef<HTMLInputElement | null>(null);
-  const [reimporting, setReimporting] = useState(false);
+  const [reimportPassword, setReimportPassword] = useState('');
+  const lastHandledReimportRef = useRef<string | null>(null);
+
+  const reimportInFlight =
+    state.import.mode === 'reimport' &&
+    (state.import.status === 'uploading' || state.import.status === 'parsing');
+  const reimportPwOpen =
+    state.import.mode === 'reimport' &&
+    state.import.status === 'password-required';
+
   const handleReimport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
+    e.target.value = '';
     if (!file || !state.activeProjectId) return;
-    setReimporting(true);
+    dispatch({
+      type: 'IMPORT_UPLOADING',
+      mode: 'reimport',
+      fileName: file.name,
+    });
+    const fd = new FormData();
+    fd.append('file', file);
     try {
-      const fd = new FormData();
-      fd.append('file', file);
       const result = await api.reimportETS(state.activeProjectId, fd);
       dispatch({
-        type: 'SET_ACTIVE',
-        id: state.activeProjectId,
-        data: result.data,
+        type: 'IMPORT_STARTED',
+        importId: result.importId,
+        mode: 'reimport',
+        fileName: file.name,
       });
-      const tgs = await api.listTelegrams(state.activeProjectId);
-      dispatch({ type: 'SET_TELEGRAMS', telegrams: tgs });
-      const projs = await api.listProjects();
-      dispatch({ type: 'SET_PROJECTS', projects: projs });
     } catch (err: any) {
-      alert(`Reimport failed: ${err.message}`);
+      dispatch({
+        type: 'IMPORT_FAILED',
+        importId: '',
+        error: err.message || 'Reimport failed',
+        code: err.code,
+      });
     }
-    setReimporting(false);
-    e.target.value = '';
   };
+
+  const submitReimportPassword = async () => {
+    const importId = state.import.importId;
+    if (!importId || !reimportPassword) return;
+    try {
+      await api.submitImportPassword(importId, reimportPassword);
+      setReimportPassword('');
+      dispatch({ type: 'IMPORT_PARSING', importId });
+    } catch (err: any) {
+      dispatch({
+        type: 'IMPORT_FAILED',
+        importId,
+        error: err.message || 'Failed to submit password',
+        code: err.code,
+      });
+    }
+  };
+
+  // When a reimport completes, reload the active project so the UI shows
+  // the new data. (The project list refresh is handled in App.tsx.)
+  useEffect(() => {
+    if (state.import.mode !== 'reimport') return;
+    const importId = state.import.importId;
+    if (!importId || lastHandledReimportRef.current === importId) return;
+
+    if (state.import.status === 'done' && state.import.projectId) {
+      lastHandledReimportRef.current = importId;
+      const pid = state.import.projectId;
+      (async () => {
+        try {
+          const data = await api.getProject(pid);
+          dispatch({ type: 'SET_ACTIVE', id: pid, data });
+          const tgs = await api.listTelegrams(pid);
+          dispatch({ type: 'SET_TELEGRAMS', telegrams: tgs });
+          setToast(`Reimported ${state.import.fileName ?? ''}`.trim());
+        } catch (e: any) {
+          setToast(`Reload failed: ${e.message}`);
+        } finally {
+          dispatch({ type: 'IMPORT_RESET' });
+        }
+      })();
+    } else if (state.import.status === 'failed') {
+      lastHandledReimportRef.current = importId;
+      setToast(`Reimport failed: ${state.import.error ?? 'unknown error'}`);
+      dispatch({ type: 'IMPORT_RESET' });
+    }
+  }, [
+    state.import.mode,
+    state.import.status,
+    state.import.importId,
+    state.import.projectId,
+    state.import.fileName,
+    state.import.error,
+    dispatch,
+    setToast,
+  ]);
 
   const handlePin = useCallback(
     (wtype: string, address: string) => {
@@ -305,9 +376,9 @@ export function AppShell(props: AppShellProps) {
             <span
               onClick={() => reimportRef.current?.click()}
               title="Re-import .knxproj to refresh project data"
-              className={`${appStyles.reimportBadge} ${reimporting ? appStyles.reimportBadgeDisabled : `bg ${appStyles.reimportBadgeActive}`}`}
+              className={`${appStyles.reimportBadge} ${reimportInFlight ? appStyles.reimportBadgeDisabled : `bg ${appStyles.reimportBadgeActive}`}`}
             >
-              {reimporting ? 'REIMPORTING…' : 'REIMPORT'}
+              {reimportInFlight ? 'REIMPORTING…' : 'REIMPORT'}
             </span>
           </>
         )}
@@ -608,6 +679,86 @@ export function AppShell(props: AppShellProps) {
         <span className={appStyles.statusVersion}>koolenex v0.1.0-alpha</span>
       </div>
       {toast && <Toast msg={toast} onDone={() => setToast(null)} />}
+      {reimportPwOpen && (
+        <ReimportPasswordModal
+          retry={state.import.passwordRetry}
+          fileName={state.import.fileName}
+          password={reimportPassword}
+          onChange={setReimportPassword}
+          onSubmit={submitReimportPassword}
+          onCancel={() => {
+            setReimportPassword('');
+            dispatch({ type: 'IMPORT_RESET' });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+interface ReimportPasswordModalProps {
+  retry: boolean;
+  fileName: string | null;
+  password: string;
+  onChange: (v: string) => void;
+  onSubmit: () => void;
+  onCancel: () => void;
+}
+
+function ReimportPasswordModal({
+  retry,
+  fileName,
+  password,
+  onChange,
+  onSubmit,
+  onCancel,
+}: ReimportPasswordModalProps) {
+  return (
+    <div className={primStyles.modalOverlay}>
+      <div className={primStyles.modalBox}>
+        <div className={primStyles.modalTitle}>Password protected</div>
+        <div className={primStyles.modalBody}>
+          <div>
+            {fileName
+              ? `${fileName} is password-protected.`
+              : 'Enter password.'}
+          </div>
+          {retry && (
+            <div style={{ color: 'var(--red)', marginTop: 8 }}>
+              Incorrect password — try again
+            </div>
+          )}
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => onChange(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') onSubmit();
+              else if (e.key === 'Escape') onCancel();
+            }}
+            placeholder="Project password…"
+            autoFocus
+            style={{
+              width: '100%',
+              marginTop: 12,
+              padding: '6px 8px',
+              background: 'var(--bg2)',
+              border: '1px solid var(--border2)',
+              borderRadius: 4,
+              color: 'var(--text)',
+              fontSize: 12,
+            }}
+          />
+        </div>
+        <div className={primStyles.modalActions}>
+          <Btn onClick={onCancel} color="var(--dim)">
+            Cancel
+          </Btn>
+          <Btn onClick={onSubmit} disabled={!password}>
+            Unlock
+          </Btn>
+        </div>
+      </div>
     </div>
   );
 }
