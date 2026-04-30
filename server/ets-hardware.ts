@@ -70,12 +70,16 @@ export function parseHardware(
   const hwByProd: Record<string, HwInfo> = {};
   const hwByH2P: Record<string, HwInfo> = {};
 
-  for (const e of entries.filter((e) =>
+  const hwEntries = entries.filter((e) =>
     /M-[^/]+\/Hardware\.xml$/i.test(e.entryName),
-  )) {
+  );
+  logger.info('ets', 'hardware entries', { count: hwEntries.length });
+  for (let hwIdx = 0; hwIdx < hwEntries.length; hwIdx++) {
+    const e = hwEntries[hwIdx]!;
     const mfrId =
       e.entryName.match(/M-[^/]+/)?.[0] || e.entryName.split('/')[0]!;
     const mfrName = mfrById[mfrId] || mfrId;
+    const tEntry = Date.now();
     try {
       const hx = xmlParser.parse(e.getData().toString('utf8'));
       for (const mNode of toArr(hx?.KNX?.ManufacturerData?.Manufacturer)) {
@@ -186,9 +190,17 @@ export function parseHardware(
           }
         }
       }
-    } catch (e: unknown) {
+      logger.info('ets', 'hardware entry done', {
+        index: hwIdx,
+        name: e.entryName,
+        ms: Date.now() - tEntry,
+      });
+    } catch (err: unknown) {
       logger.error('ets', 'Hardware.xml parse error', {
-        error: (e as Error).message,
+        index: hwIdx,
+        name: e.entryName,
+        ms: Date.now() - tEntry,
+        error: (err as Error).message,
       });
     }
   }
@@ -206,12 +218,16 @@ export function parseCatalog(
   const catalogSections: CatalogSection[] = [];
   const catalogItems: CatalogItem[] = [];
 
-  for (const e of entries.filter((e) =>
+  const catEntries = entries.filter((e) =>
     /M-[^/]+\/Catalog\.xml$/i.test(e.entryName),
-  )) {
+  );
+  logger.info('ets', 'catalog entries', { count: catEntries.length });
+  for (let cIdx = 0; cIdx < catEntries.length; cIdx++) {
+    const e = catEntries[cIdx]!;
     const mfrId =
       e.entryName.match(/M-[^/]+/)?.[0] || e.entryName.split('/')[0]!;
     const mfrName = mfrById[mfrId] || mfrId;
+    const tEntry = Date.now();
     try {
       const cx = xmlParser.parse(e.getData().toString('utf8'));
       for (const mNode of toArr(cx?.KNX?.ManufacturerData?.Manufacturer)) {
@@ -282,9 +298,17 @@ export function parseCatalog(
         const catalog = mNode?.Catalog;
         walkSections(toArr(catalog?.CatalogSection), null);
       }
-    } catch (e: unknown) {
+      logger.info('ets', 'catalog entry done', {
+        index: cIdx,
+        name: e.entryName,
+        ms: Date.now() - tEntry,
+      });
+    } catch (err: unknown) {
       logger.error('ets', 'Catalog.xml parse error', {
-        error: (e as Error).message,
+        index: cIdx,
+        name: e.entryName,
+        ms: Date.now() - tEntry,
+        error: (err as Error).message,
       });
     }
   }

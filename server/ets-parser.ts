@@ -438,6 +438,9 @@ export function parseKnxproj(
       });
     }
 
+    logger.info('ets', 'inner entries', {
+      names: innerEntries.map((f) => f.entryName),
+    });
     for (const f of innerEntries) {
       const virtualEntry: ZipEntry = {
         entryName: prefix + f.entryName,
@@ -449,18 +452,38 @@ export function parseKnxproj(
   }
 
   // ── Manufacturer names ─────────────────────────────────────────────────────
+  const tMfr = Date.now();
+  logger.info('ets', 'parseMfrNames start');
   const { mfrById, knxMasterXml } = parseMfrNames(entries);
+  logger.info('ets', 'parseMfrNames done', {
+    ms: Date.now() - tMfr,
+    mfrCount: Object.keys(mfrById).length,
+  });
 
   // ── Hardware lookup ────────────────────────────────────────────────────────
+  const tHw = Date.now();
+  logger.info('ets', 'parseHardware start');
   const { hwByProd, hwByH2P } = parseHardware(entries, mfrById);
+  logger.info('ets', 'parseHardware done', {
+    ms: Date.now() - tHw,
+    products: Object.keys(hwByProd).length,
+    h2p: Object.keys(hwByH2P).length,
+  });
 
   // ── Catalog lookup ──────────────────────────────────────────────────────────
+  const tCat = Date.now();
+  logger.info('ets', 'parseCatalog start');
   const { catalogSections, catalogItems } = parseCatalog(
     entries,
     mfrById,
     hwByProd,
     hwByH2P,
   );
+  logger.info('ets', 'parseCatalog done', {
+    ms: Date.now() - tCat,
+    sections: catalogSections.length,
+    items: catalogItems.length,
+  });
 
   // ── Application program indexes ────────────────────────────────────────────
   // Keyed by "M-00FA_A-2504-10-C071" (appId without path/extension)
@@ -468,16 +491,33 @@ export function parseKnxproj(
   const appEntries = entries.filter((e) =>
     /M-[^/]+\/M-[^/]+_A-[^/]+\.xml$/i.test(e.entryName),
   );
-  for (const e of appEntries) {
+  const tApp = Date.now();
+  logger.info('ets', 'app index loop start', { count: appEntries.length });
+  let appOk = 0;
+  let appErr = 0;
+  for (let i = 0; i < appEntries.length; i++) {
+    const e = appEntries[i]!;
+    const tEntry = Date.now();
     try {
-      const idx = buildAppIndex(e.getData());
+      const buf = e.getData();
+      const idx = buildAppIndex(buf);
       if (idx?.appId) appByAppId[idx.appId] = idx;
-    } catch (e: unknown) {
+      appOk++;
+    } catch (err: unknown) {
+      appErr++;
       logger.error('ets', 'app XML parse error', {
-        error: (e as Error).message,
+        name: e.entryName,
+        index: i,
+        ms: Date.now() - tEntry,
+        error: (err as Error).message,
       });
     }
   }
+  logger.info('ets', 'app index loop done', {
+    ms: Date.now() - tApp,
+    ok: appOk,
+    err: appErr,
+  });
 
   // Given a Hardware2ProgramRefId like "M-00FA_H-xxx_HP-2504-10-C071"
   // the matching appId is "M-00FA_A-2504-10-C071".

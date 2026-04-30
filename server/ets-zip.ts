@@ -34,13 +34,33 @@ const Minizip = require_('minizip-asm.js') as new (
 export function openZip(buffer: Buffer, password?: string): ZipEntry[] {
   const mz = new Minizip(buffer);
   const opts = password ? { password } : undefined;
+  const encrypted = !!password;
   return mz.list().map((f) => {
     let cached: Buffer | null = null;
     return {
       entryName: f.filepath,
       getData: () => {
-        if (!cached) cached = Buffer.from(mz.extract(f.filepath, opts));
-        return cached;
+        if (cached) return cached;
+        const t0 = Date.now();
+        try {
+          const out = Buffer.from(mz.extract(f.filepath, opts));
+          cached = out;
+          logger.info('ets', 'extract', {
+            name: f.filepath,
+            bytes: out.length,
+            ms: Date.now() - t0,
+            encrypted,
+          });
+          return out;
+        } catch (e) {
+          logger.warn('ets', 'extract failed', {
+            name: f.filepath,
+            ms: Date.now() - t0,
+            encrypted,
+            error: (e as Error).message,
+          });
+          throw e;
+        }
       },
     };
   });
