@@ -542,6 +542,80 @@ describe('KnxConnection.downloadDevice', () => {
       { message: 'Not connected' },
     );
   });
+
+  // ── AbsoluteSegment (MDT-style) procedure — routes through planDownload ──
+
+  it('routes AbsSegment-style steps through planDownload and sends the PID-5 sequence', async () => {
+    const conn = new TestKnxConnection();
+    conn.connected = true;
+    conn.localAddr = '1.0.1';
+
+    const steps: DownloadStep[] = [
+      { type: 'Connect', objIdx: 0, propId: 0 },
+      { type: 'Unload', objIdx: 0, propId: 0, lsmIdx: 1 },
+      { type: 'Load', objIdx: 0, propId: 0, lsmIdx: 1 },
+      {
+        type: 'AbsSegment',
+        objIdx: 0,
+        propId: 0,
+        lsmIdx: 1,
+        address: 0x4000,
+        size: 3,
+      },
+      { type: 'LoadCompleted', objIdx: 0, propId: 0, lsmIdx: 1 },
+      { type: 'Restart', objIdx: 0, propId: 0 },
+      { type: 'Disconnect', objIdx: 0, propId: 0 },
+    ];
+    const gaTable = Buffer.from([0x01, 0x08, 0x00]); // count=1, one GA entry
+    const progress: string[] = [];
+
+    await conn.downloadDevice(
+      '1.1.2',
+      steps,
+      gaTable,
+      null,
+      null,
+      (p) => progress.push(p.msg),
+      {},
+    );
+
+    assert.ok(progress.includes('Download complete'));
+    // 4 PID-5 propWrites (Unload, Load, Segment descriptor, LoadCompleted) +
+    // the address-table memory writes (count byte + entries) + Restart.
+    assert.ok(progress.some((m) => m.includes('PropWrite ObjIdx=1 PropId=5')));
+    assert.ok(progress.some((m) => m.includes('MemWrite Addr=0x4000')));
+    assert.ok(progress.some((m) => m.includes('Restart')));
+    // Every frame actually went out over sendCEMI (still fully in-process —
+    // TestKnxConnection.sendCEMI never touches a socket).
+    assert.ok(conn.sent.length > 0);
+  });
+
+  it('skips memory writes for AbsSegments with no source buffer', async () => {
+    const conn = new TestKnxConnection();
+    conn.connected = true;
+    conn.localAddr = '1.0.1';
+
+    const steps: DownloadStep[] = [
+      { type: 'Load', objIdx: 0, propId: 0, lsmIdx: 3 },
+      {
+        type: 'AbsSegment',
+        objIdx: 0,
+        propId: 0,
+        lsmIdx: 3,
+        address: 0x0700,
+        size: 132,
+      },
+      { type: 'LoadCompleted', objIdx: 0, propId: 0, lsmIdx: 3 },
+    ];
+    const progress: string[] = [];
+
+    await conn.downloadDevice('1.1.2', steps, null, null, null, (p) =>
+      progress.push(p.msg),
+    );
+
+    assert.ok(progress.includes('Download complete'));
+    assert.ok(!progress.some((m) => m.includes('MemWrite')));
+  });
 });
 
 // ── KnxConnection.identify ───────────────────────────────────────────────────
@@ -922,6 +996,80 @@ describe('KnxIpConnection.sendCEMI sequence', () => {
     clearTimeout(conn._pendingAck!.timer);
     conn._pendingAck!.resolve();
     conn._pendingAck = null;
+  });
+});
+
+describe('KnxIpConnection.sendCEMI queue serialization', () => {
+  function ackMsg(channelId: number, seq: number, status = 0x00): Buffer {
+    const b = Buffer.alloc(10);
+    b[0] = 0x06;
+    b[1] = 0x10;
+    b.writeUInt16BE(SVC.TUNNELING_ACK, 2);
+    b.writeUInt16BE(10, 4);
+    b[6] = 0x04;
+    b[7] = channelId;
+    b[8] = seq;
+    b[9] = status;
+    return b;
+  }
+
+  it('holds a second send off the wire until the first is ACKed, then sends it with the next sequence number', async () => {
+    const conn = new KnxIpConnection();
+    conn.connected = true;
+    conn.channelId = 1;
+    const sent: Buffer[] = [];
+    conn._sendRaw = (buf: Buffer) => sent.push(buf);
+
+    const cemi = buildCEMI('1.0.1', '1/0/0', apduGroupRead(), true);
+
+    const p1 = conn.sendCEMI(cemi, 5000);
+    const p2 = conn.sendCEMI(cemi, 5000);
+
+    // Only the first packet should be on the wire; the second is queued
+    // behind it, and _pendingAck must belong to the first send.
+    assert.equal(sent.length, 1);
+    assert.ok(conn._pendingAck);
+    assert.equal(conn._pendingAck.seq, 0);
+
+    conn._onTunnelingAck(ackMsg(1, 0));
+    await p1;
+
+    // ACKing the first send must release the second synchronously.
+    assert.equal(sent.length, 2);
+    assert.ok(conn._pendingAck);
+    assert.equal(conn._pendingAck.seq, 1);
+
+    conn._onTunnelingAck(ackMsg(1, 1));
+    await p2;
+  });
+
+  it('does not deadlock the queue when the first send times out', async () => {
+    const conn = new KnxIpConnection();
+    conn.connected = true;
+    conn.channelId = 1;
+    const sent: Buffer[] = [];
+    conn._sendRaw = (buf: Buffer) => sent.push(buf);
+
+    const cemi = buildCEMI('1.0.1', '1/0/0', apduGroupRead(), true);
+
+    const p1 = conn.sendCEMI(cemi, 50);
+    const p2 = conn.sendCEMI(cemi, 5000);
+
+    assert.equal(sent.length, 1);
+
+    await assert.rejects(p1, { message: 'Tunneling ACK timeout' });
+
+    // The internal timeout settles _sendCEMIOnce's promise via the raw
+    // closure reject (bypassing _pendingAck), so the queue drains on a
+    // follow-up microtask rather than synchronously — give it a tick.
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.equal(sent.length, 2);
+    assert.ok(conn._pendingAck);
+    assert.equal(conn._pendingAck.seq, 1);
+
+    conn._onTunnelingAck(ackMsg(1, 1));
+    await p2;
   });
 });
 

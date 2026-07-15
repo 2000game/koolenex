@@ -777,7 +777,12 @@ export function buildAppIndex(buf: Buffer): AppIndex | null {
   // baseFromMem: true when the parent Union's offset came from a <Memory> child element.
   // In that convention, all Union child params use relSeg-index offsets (not absolute ETS offsets),
   // so they must be treated identically to standalone params with <Memory> children.
-  const addParam = (p: XmlNode, baseOffset = 0, baseFromMem = false) => {
+  const addParam = (
+    p: XmlNode,
+    baseOffset = 0,
+    baseFromMem = false,
+    baseBitOffset = 0,
+  ) => {
     const id = attr(p, 'Id');
     if (!id) return;
     let rawOff = attr(p, 'Offset');
@@ -808,7 +813,11 @@ export function buildAppIndex(buf: Buffer): AppIndex | null {
           : baseOffset > 0
             ? baseOffset
             : null,
-      bitOffset: parseInt(rawBitOff, 10) || 0,
+      // A Union's bit position comes from the Union's own <Memory BitOffset>, not
+      // the child Parameter's own BitOffset (which is conventionally 0). Fold the
+      // parent's baseBitOffset in additively so a child's own nonzero BitOffset
+      // (if it ever has one) still combines correctly.
+      bitOffset: baseBitOffset + (parseInt(rawBitOff, 10) || 0),
       fromMemoryChild: fromMemoryChild,
       // DefaultUnionParameter="0" marks the first (default-active) param in a Union —
       // its default value should be written even when not in currentValues.
@@ -818,13 +827,22 @@ export function buildAppIndex(buf: Buffer): AppIndex | null {
   for (const st of allStaticSections) {
     for (const p of toArr(st.Parameters?.Parameter)) addParam(p);
     for (const u of toArr(st.Parameters?.Union)) {
-      // Union children share the union's byte offset; their own @Offset is relative to it.
-      // The union's offset may be in a <Memory Offset="X"> child element rather than a direct attribute.
+      // Union children share the union's byte offset AND bit offset; their own
+      // @Offset/@BitOffset are relative to it. The union's offset/bitOffset may
+      // be in a <Memory Offset="X" BitOffset="Y"> child element rather than
+      // direct attributes on the <Union> itself.
       let uOffset = parseInt(attr(u, 'Offset'), 10);
+      let uBitOffset = parseInt(attr(u, 'BitOffset'), 10) || 0;
       let uFromMem = false;
-      if (isNaN(uOffset) || uOffset === 0) {
-        const uMem = Array.isArray(u.Memory) ? u.Memory[0] : u.Memory;
-        if (uMem) {
+      // The Union's <Memory> child can supply the byte offset, the bit offset,
+      // or both. Read it whenever present so a Union that carries its BitOffset
+      // in <Memory> is not dropped just because its byte Offset happens to be a
+      // direct (nonzero) attribute.
+      const uMem = Array.isArray(u.Memory) ? u.Memory[0] : u.Memory;
+      if (uMem) {
+        const memBitOff = parseInt(attr(uMem, 'BitOffset'), 10);
+        if (!isNaN(memBitOff)) uBitOffset = memBitOff;
+        if (isNaN(uOffset) || uOffset === 0) {
           const memOff = parseInt(attr(uMem, 'Offset'), 10);
           if (!isNaN(memOff)) {
             uOffset = memOff;
@@ -833,7 +851,8 @@ export function buildAppIndex(buf: Buffer): AppIndex | null {
         }
       }
       if (isNaN(uOffset)) uOffset = 0;
-      for (const p of toArr(u.Parameter)) addParam(p, uOffset, uFromMem);
+      for (const p of toArr(u.Parameter))
+        addParam(p, uOffset, uFromMem, uBitOffset);
     }
   }
 

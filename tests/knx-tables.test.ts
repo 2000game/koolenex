@@ -2,6 +2,13 @@
  * Tests for KNX table builder functions: buildUnconditionalChannelSet,
  * evalConditionallyActiveParamRefs, collectActiveAssigns, resolveParamSegment,
  * and buildParamMem.
+ *
+ * dynTree fixtures use the REAL emitted schema (matches DynItem in
+ * server/ets-app.ts): a single recursive `items` array of tagged nodes,
+ * `dynTree.main.items -> DynItem[]`, where `type` is one of
+ * cib/channel/block/choose/paramRef/assign/... — NOT the legacy
+ * channels/cib/pb + paramRefs/blocks/choices shape (that shape is never
+ * actually produced by the parser).
  */
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
@@ -12,7 +19,54 @@ import {
   collectActiveAssigns,
   resolveParamSegment,
   buildParamMem,
+  diffMemory,
 } from '../server/routes/knx-tables.ts';
+
+// ── diffMemory ──────────────────────────────────────────────────────────────
+
+describe('diffMemory', () => {
+  it('reports no differences for identical buffers', () => {
+    const buf = Buffer.from([0x01, 0x02, 0x03, 0x04]);
+    const d = diffMemory(buf, Buffer.from(buf), 0x0100);
+    assert.equal(d.total, 4);
+    assert.equal(d.differing, 0);
+    assert.equal(d.matching, 4);
+    assert.deepEqual(d.chunks, []);
+  });
+
+  it('coalesces consecutive differing bytes into one chunk with absolute address', () => {
+    const expected = Buffer.from([0x00, 0xaa, 0xbb, 0x00, 0x00]);
+    const actual = Buffer.from([0x00, 0x11, 0x22, 0x00, 0x00]);
+    const d = diffMemory(expected, actual, 0x0100);
+    assert.equal(d.differing, 2);
+    assert.equal(d.matching, 3);
+    assert.equal(d.chunks.length, 1);
+    assert.deepEqual(d.chunks[0], {
+      address: 0x0101,
+      expected: 'aabb',
+      actual: '1122',
+    });
+  });
+
+  it('separates non-adjacent differences into distinct chunks', () => {
+    const expected = Buffer.from([0xaa, 0x00, 0x00, 0xbb]);
+    const actual = Buffer.from([0x11, 0x00, 0x00, 0x22]);
+    const d = diffMemory(expected, actual, 0x2000);
+    assert.equal(d.differing, 2);
+    assert.equal(d.chunks.length, 2);
+    assert.equal(d.chunks[0]!.address, 0x2000);
+    assert.equal(d.chunks[1]!.address, 0x2003);
+  });
+
+  it('compares only up to the shorter buffer length', () => {
+    const expected = Buffer.from([0x01, 0x02, 0x03]);
+    const actual = Buffer.from([0x01, 0x99]);
+    const d = diffMemory(expected, actual, 0);
+    assert.equal(d.total, 2);
+    assert.equal(d.differing, 1);
+    assert.equal(d.chunks[0]!.address, 1);
+  });
+});
 
 // ── buildUnconditionalChannelSet ────────────────────────────────────────────
 
@@ -27,12 +81,18 @@ describe('buildUnconditionalChannelSet', () => {
     assert.equal(buildUnconditionalChannelSet(undefined).size, 0);
   });
 
-  it('collects paramRefs from channels', () => {
+  it('collects paramRefs from channel items', () => {
     const dynTree: any = {
       main: {
-        channels: [
-          { node: { paramRefs: ['pr1', 'pr2'] } },
-          { node: { paramRefs: ['pr3'] } },
+        items: [
+          {
+            type: 'channel',
+            items: [
+              { type: 'paramRef', refId: 'pr1' },
+              { type: 'paramRef', refId: 'pr2' },
+            ],
+          },
+          { type: 'channel', items: [{ type: 'paramRef', refId: 'pr3' }] },
         ],
       },
     };
@@ -43,14 +103,22 @@ describe('buildUnconditionalChannelSet', () => {
   it('collects paramRefs from nested blocks', () => {
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              paramRefs: ['pr1'],
-              blocks: [
-                { paramRefs: ['pr2'], blocks: [{ paramRefs: ['pr3'] }] },
-              ],
-            },
+            type: 'channel',
+            items: [
+              { type: 'paramRef', refId: 'pr1' },
+              {
+                type: 'block',
+                items: [
+                  { type: 'paramRef', refId: 'pr2' },
+                  {
+                    type: 'block',
+                    items: [{ type: 'paramRef', refId: 'pr3' }],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -59,20 +127,26 @@ describe('buildUnconditionalChannelSet', () => {
     assert.deepEqual([...s].sort(), ['pr1', 'pr2', 'pr3']);
   });
 
-  it('does NOT walk into choices — paramRefs inside choices excluded', () => {
+  it('does NOT walk into choose — paramRefs inside choose excluded', () => {
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              paramRefs: ['pr1'],
-              choices: [
-                {
-                  paramRefId: 'pr1',
-                  whens: [{ test: ['1'], node: { paramRefs: ['pr_hidden'] } }],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              { type: 'paramRef', refId: 'pr1' },
+              {
+                type: 'choose',
+                paramRefId: 'pr1',
+                whens: [
+                  {
+                    test: ['1'],
+                    isDefault: false,
+                    items: [{ type: 'paramRef', refId: 'pr_hidden' }],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -82,32 +156,42 @@ describe('buildUnconditionalChannelSet', () => {
     assert.equal(s.has('pr_hidden'), false);
   });
 
-  it('collects paramRefs from cib section', () => {
+  it('collects paramRefs from cib items', () => {
     const dynTree: any = {
       main: {
-        cib: [{ paramRefs: ['cib1', 'cib2'] }],
+        items: [
+          {
+            type: 'cib',
+            items: [
+              { type: 'paramRef', refId: 'cib1' },
+              { type: 'paramRef', refId: 'cib2' },
+            ],
+          },
+        ],
       },
     };
     const s = buildUnconditionalChannelSet(dynTree);
     assert.deepEqual([...s].sort(), ['cib1', 'cib2']);
   });
 
-  it('collects paramRefs from pb section', () => {
+  it('collects paramRefs from a top-level block', () => {
     const dynTree: any = {
       main: {
-        pb: [{ paramRefs: ['pb1'] }],
+        items: [{ type: 'block', items: [{ type: 'paramRef', refId: 'pb1' }] }],
       },
     };
     const s = buildUnconditionalChannelSet(dynTree);
     assert.deepEqual([...s], ['pb1']);
   });
 
-  it('collects from channels, cib, and pb combined', () => {
+  it('collects from channel, cib, and block items combined', () => {
     const dynTree: any = {
       main: {
-        channels: [{ node: { paramRefs: ['ch1'] } }],
-        cib: [{ paramRefs: ['cib1'] }],
-        pb: [{ paramRefs: ['pb1'] }],
+        items: [
+          { type: 'channel', items: [{ type: 'paramRef', refId: 'ch1' }] },
+          { type: 'cib', items: [{ type: 'paramRef', refId: 'cib1' }] },
+          { type: 'block', items: [{ type: 'paramRef', refId: 'pb1' }] },
+        ],
       },
     };
     const s = buildUnconditionalChannelSet(dynTree);
@@ -134,19 +218,25 @@ describe('evalConditionallyActiveParamRefs', () => {
   it('marks paramRefs in matched when branch as conditional', () => {
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'selector',
-                  whens: [
-                    { test: ['1'], node: { paramRefs: ['active_pr'] } },
-                    { test: ['2'], node: { paramRefs: ['inactive_pr'] } },
-                  ],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'selector',
+                whens: [
+                  {
+                    test: ['1'],
+                    items: [{ type: 'paramRef', refId: 'active_pr' }],
+                  },
+                  {
+                    test: ['2'],
+                    items: [{ type: 'paramRef', refId: 'inactive_pr' }],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -160,19 +250,25 @@ describe('evalConditionallyActiveParamRefs', () => {
   it('walks default when if no match found', () => {
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'selector',
-                  whens: [
-                    { test: ['99'], node: { paramRefs: ['no_match_pr'] } },
-                    { isDefault: true, node: { paramRefs: ['default_pr'] } },
-                  ],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'selector',
+                whens: [
+                  {
+                    test: ['99'],
+                    items: [{ type: 'paramRef', refId: 'no_match_pr' }],
+                  },
+                  {
+                    isDefault: true,
+                    items: [{ type: 'paramRef', refId: 'default_pr' }],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -186,16 +282,18 @@ describe('evalConditionallyActiveParamRefs', () => {
   it('returns empty when no match and no default', () => {
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'selector',
-                  whens: [{ test: ['99'], node: { paramRefs: ['pr1'] } }],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'selector',
+                whens: [
+                  { test: ['99'], items: [{ type: 'paramRef', refId: 'pr1' }] },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -208,19 +306,25 @@ describe('evalConditionallyActiveParamRefs', () => {
   it('currentValues override defaultValue', () => {
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'selector',
-                  whens: [
-                    { test: ['1'], node: { paramRefs: ['branch1'] } },
-                    { test: ['2'], node: { paramRefs: ['branch2'] } },
-                  ],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'selector',
+                whens: [
+                  {
+                    test: ['1'],
+                    items: [{ type: 'paramRef', refId: 'branch1' }],
+                  },
+                  {
+                    test: ['2'],
+                    items: [{ type: 'paramRef', refId: 'branch2' }],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -234,37 +338,36 @@ describe('evalConditionallyActiveParamRefs', () => {
     assert.equal(s.has('branch2'), true);
   });
 
-  it('evaluates nested choices recursively', () => {
+  it('evaluates nested choose recursively', () => {
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'outer',
-                  whens: [
-                    {
-                      test: ['1'],
-                      node: {
-                        paramRefs: ['outer_pr'],
-                        choices: [
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'outer',
+                whens: [
+                  {
+                    test: ['1'],
+                    items: [
+                      { type: 'paramRef', refId: 'outer_pr' },
+                      {
+                        type: 'choose',
+                        paramRefId: 'inner',
+                        whens: [
                           {
-                            paramRefId: 'inner',
-                            whens: [
-                              {
-                                test: ['5'],
-                                node: { paramRefs: ['inner_pr'] },
-                              },
-                            ],
+                            test: ['5'],
+                            items: [{ type: 'paramRef', refId: 'inner_pr' }],
                           },
                         ],
                       },
-                    },
-                  ],
-                },
-              ],
-            },
+                    ],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -278,13 +381,16 @@ describe('evalConditionallyActiveParamRefs', () => {
     assert.equal(s.has('inner_pr'), true);
   });
 
-  it('handles choices at section level (not inside channel node)', () => {
+  it('handles choose at top level (not inside a channel item)', () => {
     const dynTree: any = {
       main: {
-        choices: [
+        items: [
           {
+            type: 'choose',
             paramRefId: 'sec_sel',
-            whens: [{ test: ['1'], node: { paramRefs: ['sec_pr'] } }],
+            whens: [
+              { test: ['1'], items: [{ type: 'paramRef', refId: 'sec_pr' }] },
+            ],
           },
         ],
       },
@@ -300,7 +406,11 @@ describe('evalConditionallyActiveParamRefs', () => {
 describe('collectActiveAssigns', () => {
   it('returns empty array when no assigns exist', () => {
     const dynTree: any = {
-      main: { channels: [{ node: { paramRefs: ['pr1'] } }] },
+      main: {
+        items: [
+          { type: 'channel', items: [{ type: 'paramRef', refId: 'pr1' }] },
+        ],
+      },
     };
     const result = collectActiveAssigns(dynTree, {}, {});
     assert.deepEqual(result, []);
@@ -312,19 +422,30 @@ describe('collectActiveAssigns', () => {
   });
 
   it('collects assigns from active when branch', () => {
-    const assign = { target: 'tgt', source: 'src', value: null };
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'sel',
-                  whens: [{ test: ['1'], node: { assigns: [assign] } }],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'sel',
+                whens: [
+                  {
+                    test: ['1'],
+                    items: [
+                      {
+                        type: 'assign',
+                        target: 'tgt',
+                        source: 'src',
+                        value: null,
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -332,24 +453,35 @@ describe('collectActiveAssigns', () => {
     const params: any = { sel: { defaultValue: '1' } };
     const result = collectActiveAssigns(dynTree, params, {});
     assert.equal(result.length, 1);
-    assert.equal(result[0].target, 'tgt');
-    assert.equal(result[0].source, 'src');
+    assert.equal(result[0]!.target, 'tgt');
+    assert.equal(result[0]!.source, 'src');
   });
 
   it('does not collect assigns from inactive when branch', () => {
-    const assign = { target: 'tgt', source: null, value: '42' };
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'sel',
-                  whens: [{ test: ['99'], node: { assigns: [assign] } }],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'sel',
+                whens: [
+                  {
+                    test: ['99'],
+                    items: [
+                      {
+                        type: 'assign',
+                        target: 'tgt',
+                        source: null,
+                        value: '42',
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -360,22 +492,31 @@ describe('collectActiveAssigns', () => {
   });
 
   it('collects assigns from default when branch when no match', () => {
-    const assign = { target: 'tgt', source: null, value: '10' };
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'sel',
-                  whens: [
-                    { test: ['99'], node: { assigns: [] } },
-                    { isDefault: true, node: { assigns: [assign] } },
-                  ],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'sel',
+                whens: [
+                  { test: ['99'], items: [] },
+                  {
+                    isDefault: true,
+                    items: [
+                      {
+                        type: 'assign',
+                        target: 'tgt',
+                        source: null,
+                        value: '10',
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -383,19 +524,25 @@ describe('collectActiveAssigns', () => {
     const params: any = { sel: { defaultValue: '0' } };
     const result = collectActiveAssigns(dynTree, params, {});
     assert.equal(result.length, 1);
-    assert.equal(result[0].value, '10');
+    assert.equal(result[0]!.value, '10');
   });
 
-  it('collects assigns from top-level channel nodes (not inside choice)', () => {
-    const assign = { target: 'tgt', source: null, value: '7' };
+  it('collects assigns from top-level channel items (not inside choose)', () => {
     const dynTree: any = {
       main: {
-        channels: [{ node: { assigns: [assign] } }],
+        items: [
+          {
+            type: 'channel',
+            items: [
+              { type: 'assign', target: 'tgt', source: null, value: '7' },
+            ],
+          },
+        ],
       },
     };
     const result = collectActiveAssigns(dynTree, {}, {});
     assert.equal(result.length, 1);
-    assert.equal(result[0].value, '7');
+    assert.equal(result[0]!.value, '7');
   });
 });
 
@@ -408,6 +555,7 @@ describe('resolveParamSegment', () => {
       paramSize: 0,
       paramFill: 0xff,
       relSegHex: null,
+      paramBase: null,
     });
   });
 
@@ -420,6 +568,7 @@ describe('resolveParamSegment', () => {
     assert.equal(result.paramSize, 64);
     assert.equal(result.paramFill, 0xff);
     assert.equal(result.relSegHex, 'aabbccdd');
+    assert.equal(result.paramBase, null);
   });
 
   it('uses RelSegment step with size, fill, and lsmIdx', () => {
@@ -431,6 +580,7 @@ describe('resolveParamSegment', () => {
     assert.equal(result.paramSize, 32);
     assert.equal(result.paramFill, 0x00);
     assert.equal(result.relSegHex, '11223344');
+    assert.equal(result.paramBase, null);
   });
 
   it('defaults fill to 0xff and lsmIdx to 4 for RelSegment', () => {
@@ -459,8 +609,8 @@ describe('resolveParamSegment', () => {
     const model: any = {
       loadProcedures: [],
       absSegData: {
-        seg1: { size: 10, hex: 'aa' },
-        seg2: { size: 256, hex: 'bb' },
+        10: { size: 10, hex: 'aa' },
+        256: { size: 256, hex: 'bb' },
       },
       paramMemLayout: {
         pr1: { offset: 5 },
@@ -471,14 +621,42 @@ describe('resolveParamSegment', () => {
     assert.equal(result.paramSize, 256);
     assert.equal(result.paramFill, 0x00);
     assert.equal(result.relSegHex, 'bb');
+    assert.equal(result.paramBase, 256);
+  });
+
+  it('picks the tightest-fitting segment, not merely the first larger one', () => {
+    // Reproduces the 1.1.3 (MDT AKS-0416.03) bug: a big, unrelated segment
+    // (the address table at 0x4000, size 513) also happens to be larger than
+    // maxOffset, but the real parameter segment is the smaller one whose
+    // range actually contains the parameter offsets (0x44EC, size 304).
+    const model: any = {
+      loadProcedures: [],
+      absSegData: {
+        1792: { size: 132, hex: '' },
+        1924: { size: 1, hex: '' },
+        16384: { size: 513, hex: 'aa' }, // address table — larger, but wrong
+        16897: { size: 511, hex: 'bb' }, // association table
+        17408: { size: 236, hex: 'cc' }, // GO table
+        17644: { size: 304, hex: 'dd' }, // the real parameter segment
+      },
+      paramMemLayout: {
+        pr1: { offset: 0 },
+        pr2: { offset: 302 },
+      },
+    };
+    const result = resolveParamSegment(model);
+    assert.equal(result.paramSize, 304);
+    assert.equal(result.paramBase, 17644); // 0x44EC
+    assert.equal(result.relSegHex, 'dd');
+    assert.equal(result.paramFill, 0x00);
   });
 
   it('falls back to largest AbsoluteSegment when none covers max offset', () => {
     const model: any = {
       loadProcedures: [],
       absSegData: {
-        seg1: { size: 10, hex: 'aa' },
-        seg2: { size: 50, hex: 'bb' },
+        10: { size: 10, hex: 'aa' },
+        50: { size: 50, hex: 'bb' },
       },
       paramMemLayout: {
         pr1: { offset: 200 },
@@ -489,12 +667,13 @@ describe('resolveParamSegment', () => {
     assert.equal(result.paramSize, 50);
     assert.equal(result.paramFill, 0x00);
     assert.equal(result.relSegHex, 'bb');
+    assert.equal(result.paramBase, 50);
   });
 
   it('returns fallback when absSegData exists but paramMemLayout is empty', () => {
     const model: any = {
       loadProcedures: [],
-      absSegData: { seg1: { size: 100, hex: 'ff' } },
+      absSegData: { 100: { size: 100, hex: 'ff' } },
       paramMemLayout: {},
     };
     const result = resolveParamSegment(model);
@@ -502,7 +681,33 @@ describe('resolveParamSegment', () => {
       paramSize: 0,
       paramFill: 0xff,
       relSegHex: null,
+      paramBase: null,
     });
+  });
+
+  it('picks the tightest-fitting AbsoluteSegment when several exceed maxOffset', () => {
+    // Two segments both larger than the largest param offset (200): the address
+    // table (0x4000, size 512) and the real parameter segment (0x44EC, size
+    // 304). resolveParamSegment must pick the SMALLEST covering segment, not
+    // the first — otherwise the param image lands at the wrong base.
+    const model = {
+      loadProcedures: [
+        { type: 'Load', lsmIdx: 1 },
+        { type: 'AbsSegment', lsmIdx: 1, address: 0x4000, size: 512 },
+        { type: 'AbsSegment', lsmIdx: 3, address: 0x44ec, size: 304 },
+      ],
+      absSegData: {
+        '16384': { size: 512, hex: '00' },
+        '17644': { size: 304, hex: '00' },
+      },
+      paramMemLayout: {
+        p1: { offset: 0, bitOffset: 0, bitSize: 8, defaultValue: '0' },
+        p2: { offset: 200, bitOffset: 0, bitSize: 8, defaultValue: '0' },
+      },
+    };
+    const result = resolveParamSegment(model as never);
+    assert.equal(result.paramBase, 0x44ec);
+    assert.equal(result.paramSize, 304);
   });
 });
 
@@ -667,23 +872,28 @@ describe('buildParamMem', () => {
     };
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'sel',
-                  whens: [
-                    {
-                      test: ['1'],
-                      node: {
-                        assigns: [{ target: 'tgt', source: null, value: '77' }],
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'sel',
+                whens: [
+                  {
+                    test: ['1'],
+                    items: [
+                      {
+                        type: 'assign',
+                        target: 'tgt',
+                        source: null,
+                        value: '77',
                       },
-                    },
-                  ],
-                },
-              ],
-            },
+                    ],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -704,11 +914,12 @@ describe('buildParamMem', () => {
     };
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              assigns: [{ target: 'tgt', source: 'src', value: null }],
-            },
+            type: 'channel',
+            items: [
+              { type: 'assign', target: 'tgt', source: 'src', value: null },
+            ],
           },
         ],
       },
@@ -736,7 +947,9 @@ describe('buildParamMem', () => {
     };
     const dynTree: any = {
       main: {
-        channels: [{ node: { paramRefs: ['pr1'] } }],
+        items: [
+          { type: 'channel', items: [{ type: 'paramRef', refId: 'pr1' }] },
+        ],
       },
     };
     const params: any = { pr1: { defaultValue: '42' } };
@@ -758,16 +971,68 @@ describe('buildParamMem', () => {
     };
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'sel',
-                  whens: [{ test: ['1'], node: { paramRefs: ['cond_pr'] } }],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'sel',
+                whens: [
+                  {
+                    test: ['1'],
+                    items: [{ type: 'paramRef', refId: 'cond_pr' }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    };
+    const params: any = {
+      sel: { defaultValue: '1' },
+      cond_pr: { defaultValue: '88' },
+    };
+    const buf = buildParamMem(4, layout, {}, 0x00, null, dynTree, params);
+    assert.equal(buf[1], 88);
+  });
+
+  // Patch 2 regression test: ETS writes every resolved-ACTIVE parameter
+  // regardless of the ParameterRef's UI visibility. A param can be
+  // Access="None" (isVisible:false) yet still sit in the currently-active
+  // `choose` branch — e.g. MDT P-5014/P-8 (block offset +0x1c) and P-5030
+  // (offset +0x31) from the real 1.1.3 gold-data investigation. Before the
+  // fix, the gate ANDed in `info.isVisible` and silently dropped these.
+  it('conditional visibility: ACTIVE param is written even when isVisible is false', () => {
+    const layout: any = {
+      sel: { offset: 0, bitOffset: 0, bitSize: 8, defaultValue: '1' },
+      cond_pr: {
+        offset: 1,
+        bitOffset: 0,
+        bitSize: 8,
+        defaultValue: '88',
+        fromMemoryChild: true,
+        isVisible: false,
+      },
+    };
+    const dynTree: any = {
+      main: {
+        items: [
+          {
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'sel',
+                whens: [
+                  {
+                    test: ['1'],
+                    items: [{ type: 'paramRef', refId: 'cond_pr' }],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -794,19 +1059,22 @@ describe('buildParamMem', () => {
     };
     const dynTree: any = {
       main: {
-        channels: [
+        items: [
           {
-            node: {
-              choices: [
-                {
-                  paramRefId: 'sel',
-                  whens: [
-                    // cond_pr only active when sel=1, but sel defaults to 2
-                    { test: ['1'], node: { paramRefs: ['cond_pr'] } },
-                  ],
-                },
-              ],
-            },
+            type: 'channel',
+            items: [
+              {
+                type: 'choose',
+                paramRefId: 'sel',
+                whens: [
+                  // cond_pr only active when sel=1, but sel defaults to 2
+                  {
+                    test: ['1'],
+                    items: [{ type: 'paramRef', refId: 'cond_pr' }],
+                  },
+                ],
+              },
+            ],
           },
         ],
       },
@@ -832,7 +1100,7 @@ describe('buildParamMem', () => {
       },
     };
     const dynTree: any = {
-      main: { channels: [] },
+      main: { items: [] },
     };
     const params: any = { hidden_pr: { defaultValue: '0' } };
     const buf = buildParamMem(

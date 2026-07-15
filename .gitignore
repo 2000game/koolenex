@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+client/node_modules/
+
+# Local SQLite database (may contain an imported project's private data —
+# device serials, topology, group addresses). Never commit.
+koolenex.db
+*.db
+
+# Imported/derived project + manufacturer data. `data/apps` holds application
+# program models extracted from KNX manufacturer product databases (.knxprod);
+# `data/floorplans` holds uploaded plans. These are per-installation and/or
+# manufacturer-copyrighted — never commit.
+data/
+
+# Build output
+client/dist/
+
+# Editor / OS
+.DS_Store

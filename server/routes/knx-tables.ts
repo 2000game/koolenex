@@ -1,45 +1,47 @@
 // ── KNX table builders ────────────────────────────────────────────────────────
 
-// ── ETS dynamic tree types ───────────────────────────────────────────────────
-
-export interface DynNode {
-  paramRefs?: string[];
-  blocks?: DynNode[];
-  choices?: DynChoice[];
-  assigns?: DynAssign[];
-}
+// ── ETS dynamic tree types (matches ets-app.ts DynItem emission) ────────────
+// The stored model shape is a single recursive `items` array of tagged
+// DynItems: dynTree.main.items -> DynItem[], where each item's `type` is one
+// of cib/channel/block/choose/paramRef/assign/comRef/rename/separator. This
+// mirrors the `DynItem` union in server/ets-app.ts — NOT the legacy
+// channels/cib/pb + paramRefs/blocks/choices shape that emission never
+// actually produces.
 
 export interface DynWhen {
   test?: string[];
   isDefault?: boolean;
-  node?: DynNode;
+  items?: DynItem[];
 }
 
-export interface DynChoice {
-  paramRefId: string;
-  defaultValue?: string;
+export interface DynItem {
+  type:
+    | 'paramRef'
+    | 'block'
+    | 'channel'
+    | 'cib'
+    | 'choose'
+    | 'assign'
+    | 'comRef'
+    | 'rename'
+    | 'separator';
+  // paramRef
+  refId?: string;
+  // block / channel / cib
+  items?: DynItem[];
+  // choose
+  paramRefId?: string;
+  defaultValue?: string | null;
   whens?: DynWhen[];
-}
-
-export interface DynAssign {
-  target: string;
-  source: string | null;
-  value: string | null;
-}
-
-export interface DynChannel {
-  node?: DynNode;
-}
-
-export interface DynSection {
-  channels?: DynChannel[];
-  cib?: DynNode[];
-  pb?: DynNode[];
-  choices?: DynChoice[];
+  // assign
+  target?: string;
+  source?: string | null;
+  value?: string | null;
 }
 
 export interface DynTree {
-  main?: DynSection;
+  main?: { items?: DynItem[] } | null;
+  moduleDefs?: { id: string; items: DynItem[] }[];
 }
 
 export interface ParamDef {
@@ -86,6 +88,11 @@ export interface ParamSegmentResult {
   paramSize: number;
   paramFill: number;
   relSegHex: string | null;
+  /**
+   * Absolute base address of the resolved AbsoluteSegment (null for
+   * RelSegment/WriteRelMem devices, which address memory relatively).
+   */
+  paramBase: number | null;
 }
 
 export interface GaLink {
@@ -101,6 +108,60 @@ export interface CoRow {
 }
 
 // Build GA table bytes: [count(1)] + [GA_encoded(2) x count]
+export interface MemoryDiffChunk {
+  address: number;
+  expected: string;
+  actual: string;
+}
+
+export interface MemoryDiffResult {
+  total: number;
+  matching: number;
+  differing: number;
+  chunks: MemoryDiffChunk[];
+}
+
+/**
+ * Byte-compare a computed image against actual device memory read back from the
+ * bus. Compares over the shorter of the two lengths and coalesces consecutive
+ * differing bytes into chunks, each tagged with its absolute device address
+ * (baseAddress + offset). Used by the read-first verification flow — no writes.
+ */
+export function diffMemory(
+  expected: Buffer,
+  actual: Buffer,
+  baseAddress: number,
+): MemoryDiffResult {
+  const total = Math.min(expected.length, actual.length);
+  const chunks: MemoryDiffChunk[] = [];
+  let differing = 0;
+  let run: { start: number; exp: number[]; act: number[] } | null = null;
+
+  const flush = (): void => {
+    if (!run) return;
+    chunks.push({
+      address: baseAddress + run.start,
+      expected: Buffer.from(run.exp).toString('hex'),
+      actual: Buffer.from(run.act).toString('hex'),
+    });
+    run = null;
+  };
+
+  for (let i = 0; i < total; i++) {
+    if (expected[i] !== actual[i]) {
+      differing++;
+      if (!run) run = { start: i, exp: [], act: [] };
+      run.exp.push(expected[i]!);
+      run.act.push(actual[i]!);
+    } else {
+      flush();
+    }
+  }
+  flush();
+
+  return { total, matching: total - differing, differing, chunks };
+}
+
 export function buildGATable(gaLinks: GaLink[]): Buffer {
   const count = gaLinks.length;
   const buf = Buffer.alloc(1 + count * 2);
@@ -166,24 +227,26 @@ export function etsTestMatch(
   return false;
 }
 
-// Build the set of paramRefs that are unconditionally reachable from top-level
-// channels/cib/pb without passing through any choice/when branch.
+const CONTAINER_TYPES = new Set(['block', 'channel', 'cib']);
+
+// Build the set of paramRefs that are unconditionally reachable from the
+// top-level `items` tree without passing through any `choose` branch.
 export function buildUnconditionalChannelSet(
   dynTree: DynTree | null | undefined,
 ): Set<string> {
   const s = new Set<string>();
-  function walk(node: DynNode | undefined): void {
-    if (!node) return;
-    for (const r of node.paramRefs || []) s.add(r);
-    for (const b of node.blocks || []) walk(b);
-    // Do NOT walk into choices — params inside choices are conditional
+  function walk(items: DynItem[] | undefined): void {
+    for (const it of items || []) {
+      if (it.type === 'paramRef' && it.refId) s.add(it.refId);
+      else if (CONTAINER_TYPES.has(it.type)) walk(it.items);
+      // choose: skip — its contents are conditional
+    }
   }
-  for (const ch of dynTree?.main?.channels || []) walk(ch.node);
-  for (const ci of dynTree?.main?.cib || []) walk(ci);
-  for (const pb of dynTree?.main?.pb || []) walk(pb);
+  walk(dynTree?.main?.items);
   return s;
 }
 
+// paramRefs reachable through the CURRENTLY-ACTIVE `choose` branches.
 export function evalConditionallyActiveParamRefs(
   dynTree: DynTree | null | undefined,
   params: Record<string, ParamDef>,
@@ -194,41 +257,37 @@ export function evalConditionallyActiveParamRefs(
     if (prKey in currentValues) return String(currentValues[prKey]);
     return String(params[prKey]?.defaultValue ?? '');
   };
-  function evalChoice(choice: DynChoice, _inChoice: boolean): void {
-    const raw = getVal(choice.paramRefId);
+  function walk(items: DynItem[] | undefined, inChoice: boolean): void {
+    for (const it of items || []) {
+      if (it.type === 'paramRef') {
+        if (inChoice && it.refId) conditional.add(it.refId);
+      } else if (CONTAINER_TYPES.has(it.type)) {
+        walk(it.items, inChoice);
+      } else if (it.type === 'choose') {
+        evalChoose(it);
+      }
+    }
+  }
+  function evalChoose(ch: DynItem): void {
+    const raw = getVal(ch.paramRefId!);
     const val = String(
-      raw !== '' && raw != null ? raw : (choice.defaultValue ?? ''),
+      raw !== '' && raw != null ? raw : (ch.defaultValue ?? ''),
     );
     let matched = false;
-    let defNode: DynNode | undefined;
-    for (const w of choice.whens || []) {
+    let def: DynWhen | undefined;
+    for (const w of ch.whens || []) {
       if (w.isDefault) {
-        defNode = w.node;
+        def = w;
         continue;
       }
       if (etsTestMatch(val, w.test ?? null)) {
         matched = true;
-        walkNode(w.node, true);
+        walk(w.items, true);
       }
     }
-    if (!matched && defNode) walkNode(defNode, true);
+    if (!matched && def) walk(def.items, true);
   }
-  function walkNode(node: DynNode | undefined, inChoice: boolean): void {
-    if (!node) return;
-    for (const r of node.paramRefs || []) {
-      if (inChoice) conditional.add(r);
-    }
-    for (const b of node.blocks || []) walkNode(b, inChoice);
-    for (const choice of node.choices || []) evalChoice(choice, inChoice);
-  }
-  function walkDynSection(section: DynSection | undefined): void {
-    if (!section) return;
-    for (const ch of section.channels || []) walkNode(ch.node, false);
-    for (const ci of section.cib || []) walkNode(ci, false);
-    for (const pb of section.pb || []) walkNode(pb, false);
-    for (const choice of section.choices || []) evalChoice(choice, false);
-  }
-  walkDynSection(dynTree?.main);
+  walk(dynTree?.main?.items, false);
   return conditional;
 }
 
@@ -293,6 +352,12 @@ export function writeBits(
   buf[byteOffset] = (buf[byteOffset]! & ~bmask) | ((value << shift) & bmask);
 }
 
+export interface DynAssign {
+  target: string;
+  source: string | null;
+  value: string | null;
+}
+
 // Collect Assign operations whose when-branch is currently active.
 export function collectActiveAssigns(
   dynTree: DynTree | null | undefined,
@@ -304,39 +369,41 @@ export function collectActiveAssigns(
     if (prKey in currentValues) return String(currentValues[prKey]);
     return String(params[prKey]?.defaultValue ?? '');
   };
-  function walkNode(node: DynNode | undefined): void {
-    if (!node) return;
-    for (const ass of node.assigns || []) result.push(ass);
-    for (const b of node.blocks || []) walkNode(b);
-    for (const choice of node.choices || []) evalChoice(choice);
+  function walk(items: DynItem[] | undefined): void {
+    for (const it of items || []) {
+      if (it.type === 'assign' && it.target) {
+        result.push({
+          target: it.target,
+          source: it.source ?? null,
+          value: it.value ?? null,
+        });
+      } else if (CONTAINER_TYPES.has(it.type)) {
+        walk(it.items);
+      } else if (it.type === 'choose') {
+        evalChoose(it);
+      }
+    }
   }
-  function evalChoice(choice: DynChoice): void {
-    const raw = getVal(choice.paramRefId);
+  function evalChoose(ch: DynItem): void {
+    const raw = getVal(ch.paramRefId!);
     const val = String(
-      raw !== '' && raw != null ? raw : (choice.defaultValue ?? ''),
+      raw !== '' && raw != null ? raw : (ch.defaultValue ?? ''),
     );
     let matched = false;
-    let defNode: DynNode | undefined;
-    for (const w of choice.whens || []) {
+    let def: DynWhen | undefined;
+    for (const w of ch.whens || []) {
       if (w.isDefault) {
-        defNode = w.node;
+        def = w;
         continue;
       }
       if (etsTestMatch(val, w.test ?? null)) {
         matched = true;
-        walkNode(w.node);
+        walk(w.items);
       }
     }
-    if (!matched && defNode) walkNode(defNode);
+    if (!matched && def) walk(def.items);
   }
-  function walkDynSection(section: DynSection | undefined): void {
-    if (!section) return;
-    for (const ch of section.channels || []) walkNode(ch.node);
-    for (const ci of section.cib || []) walkNode(ci);
-    for (const pb of section.pb || []) walkNode(pb);
-    for (const choice of section.choices || []) evalChoice(choice);
-  }
-  walkDynSection(dynTree?.main);
+  walk(dynTree?.main?.items);
   return result;
 }
 
@@ -351,7 +418,7 @@ export function resolveParamSegment(model: DeviceModel): ParamSegmentResult {
     const paramFill = relSegStep?.fill ?? 0xff;
     const paramLsmIdx = relSegStep?.lsmIdx ?? 4;
     const relSegHex = model.relSegData?.[paramLsmIdx] ?? null;
-    return { paramSize, paramFill, relSegHex };
+    return { paramSize, paramFill, relSegHex, paramBase: null };
   }
   // Try AbsoluteSegment path
   const absSegs = model.absSegData ?? {};
@@ -360,17 +427,32 @@ export function resolveParamSegment(model: DeviceModel): ParamSegmentResult {
     .map((v) => v.offset)
     .filter((v): v is number => v != null);
   if (paramOffsets.length === 0 || Object.keys(absSegs).length === 0) {
-    return { paramSize: 0, paramFill: 0xff, relSegHex: null };
+    return { paramSize: 0, paramFill: 0xff, relSegHex: null, paramBase: null };
   }
   const maxOffset = Math.max(...paramOffsets);
-  for (const seg of Object.values(absSegs)) {
-    if (seg.size > maxOffset) {
-      return {
-        paramSize: seg.size,
-        paramFill: 0x00,
-        relSegHex: seg.hex ?? null,
-      };
+  // Pick the TIGHTEST-fitting segment whose size covers every parameter
+  // offset — not merely the first one larger than maxOffset. On multi-segment
+  // AbsoluteSegment devices (e.g. MDT AKS-0416.03 / 1.1.3) an unrelated,
+  // larger segment (the address table) can also exceed maxOffset by pure
+  // coincidence; the real parameter segment is the smallest segment that
+  // still contains the whole [0, maxOffset] range (confirmed against ETS's
+  // own load-state "segment" (event 3) descriptor, which encodes the true
+  // base/size).
+  let best: [string, AbsSegData] | null = null;
+  for (const entry of Object.entries(absSegs)) {
+    const seg = entry[1];
+    if (seg.size > maxOffset && (!best || seg.size < best[1].size)) {
+      best = entry;
     }
+  }
+  if (best) {
+    const [addrKey, seg] = best;
+    return {
+      paramSize: seg.size,
+      paramFill: 0x00,
+      relSegHex: seg.hex ?? null,
+      paramBase: Number(addrKey),
+    };
   }
   // Fallback: use the largest segment
   const largest = Object.entries(absSegs).sort(
@@ -381,9 +463,10 @@ export function resolveParamSegment(model: DeviceModel): ParamSegmentResult {
       paramSize: largest[1].size,
       paramFill: 0x00,
       relSegHex: largest[1].hex ?? null,
+      paramBase: Number(largest[0]),
     };
   }
-  return { paramSize: 0, paramFill: 0xff, relSegHex: null };
+  return { paramSize: 0, paramFill: 0xff, relSegHex: null, paramBase: null };
 }
 
 // Build parameter memory segment from the paramMemLayout.
@@ -424,9 +507,7 @@ export function buildParamMem(
         // Unconditionally visible — write it
       } else {
         const passConditional =
-          conditionallyActive &&
-          conditionallyActive.has(prId) &&
-          info.isVisible;
+          conditionallyActive && conditionallyActive.has(prId);
         if (!passConditional) continue;
       }
     }

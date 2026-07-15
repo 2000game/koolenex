@@ -9,6 +9,7 @@ import {
   KnxConnection,
   type DownloadStep,
   type DownloadProgress,
+  type DownloadExtra,
   type ScanProgress,
   type DeviceInfo,
 } from './knx-connection.ts';
@@ -238,6 +239,7 @@ class KnxBusManager extends EventEmitter {
     assocTable: Buffer | null,
     paramMem: Buffer | null,
     onProgress?: (p: DownloadProgress) => void,
+    extra?: DownloadExtra,
   ): Promise<void> {
     if (!this.connection || !this.connected)
       return Promise.reject(new Error('Not connected to KNX bus'));
@@ -248,7 +250,67 @@ class KnxBusManager extends EventEmitter {
       assocTable,
       paramMem,
       onProgress,
+      extra,
     );
+  }
+
+  readMemory(
+    deviceAddr: string,
+    address: number,
+    length: number,
+    chunkSize?: number,
+  ): Promise<Buffer> {
+    if (!this.connection || !this.connected)
+      return Promise.reject(new Error('Not connected to KNX bus'));
+    return this.connection.readMemory(deviceAddr, address, length, chunkSize);
+  }
+
+  readMemoryMany(
+    deviceAddr: string,
+    regions: Array<{ address: number; length: number }>,
+    chunkSize?: number,
+  ): Promise<Buffer[]> {
+    if (!this.connection || !this.connected)
+      return Promise.reject(new Error('Not connected to KNX bus'));
+    return this.connection.readMemoryMany(deviceAddr, regions, chunkSize);
+  }
+
+  // Extended memory read (A_MemoryExtended_Read, 0x1FD) for System B / System 7
+  // devices that do not answer the legacy A_Memory_Read. Exposed here so the
+  // capability is reachable from routes; see the note in /bus/verify-device.
+  readMemoryExtended(
+    deviceAddr: string,
+    address: number,
+    length: number,
+    chunkSize?: number,
+  ): Promise<Buffer> {
+    if (!this.connection || !this.connected)
+      return Promise.reject(new Error('Not connected to KNX bus'));
+    return this.connection.readMemoryExtended(
+      deviceAddr,
+      address,
+      length,
+      chunkSize,
+    );
+  }
+
+  readProperty(
+    deviceAddr: string,
+    objIdx: number,
+    propId: number,
+  ): Promise<Buffer> {
+    if (!this.connection || !this.connected)
+      return Promise.reject(new Error('Not connected to KNX bus'));
+    return this.connection.readProperty(deviceAddr, objIdx, propId);
+  }
+
+  readPropertyMany(
+    deviceAddr: string,
+    reads: Array<{ objIdx: number; propId: number }>,
+  ): Promise<Buffer[]> {
+    if (!this.connection || !this.connected)
+      return Promise.reject(new Error('Not connected to KNX bus'));
+    return this.connection.readPropertyMany(deviceAddr, reads);
   }
 
   status(): {
