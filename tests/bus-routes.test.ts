@@ -156,6 +156,21 @@ class MockBus extends EventEmitter {
     return out;
   }
 
+  // Batched read used by verify-device: one call reads every region (the real
+  // KnxConnection drives them all inside a single management session).
+  async readMemoryMany(
+    deviceAddr: string,
+    regions: Array<{ address: number; length: number }>,
+  ): Promise<Buffer[]> {
+    this.calls.push({
+      method: 'readMemoryMany',
+      args: [deviceAddr, regions],
+    });
+    return Promise.all(
+      regions.map((r) => this.readMemory(deviceAddr, r.address, r.length)),
+    );
+  }
+
   async readProperty(
     deviceAddr: string,
     objIdx: number,
@@ -167,6 +182,19 @@ class MockBus extends EventEmitter {
     });
     if (!this.connected) throw new Error('Not connected to KNX bus');
     return this.propImage?.get(`${objIdx}/${propId}`) ?? Buffer.alloc(0);
+  }
+
+  async readPropertyMany(
+    deviceAddr: string,
+    reads: Array<{ objIdx: number; propId: number }>,
+  ): Promise<Buffer[]> {
+    this.calls.push({
+      method: 'readPropertyMany',
+      args: [deviceAddr, reads],
+    });
+    return Promise.all(
+      reads.map((rd) => this.readProperty(deviceAddr, rd.objIdx, rd.propId)),
+    );
   }
 
   listUsbDevices(): any[] {
@@ -655,6 +683,17 @@ describe('POST /bus/read-memory', () => {
     const r = await req(ts.baseUrl, 'POST', '/bus/read-memory', {
       deviceAddress: '1.1.1',
       address: 0x1_0000,
+      length: 4,
+    });
+    assert.equal(r.status, 400);
+  });
+
+  it('rejects a read that would run past the 16-bit address space', async () => {
+    mockBus.connected = true;
+    // address + length = 0x10002 > 0x10000 → would wrap on the wire.
+    const r = await req(ts.baseUrl, 'POST', '/bus/read-memory', {
+      deviceAddress: '1.1.1',
+      address: 0xfffe,
       length: 4,
     });
     assert.equal(r.status, 400);

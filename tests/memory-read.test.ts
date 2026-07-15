@@ -30,11 +30,15 @@ import { KnxConnection } from '../server/knx-connection.ts';
  */
 class FakeMemoryDevice extends KnxConnection {
   sent: Buffer[] = [];
-  constructor(
-    private readonly deviceAddr: string,
-    private readonly memory: Buffer,
-  ) {
+  // NOTE: explicit fields + body assignment — constructor parameter properties
+  // (`private readonly x`) are unsupported by Node's strip-only type stripping
+  // (`node --test`) and would make this whole file fail to load.
+  private readonly deviceAddr: string;
+  private readonly memory: Buffer;
+  constructor(deviceAddr: string, memory: Buffer) {
     super();
+    this.deviceAddr = deviceAddr;
+    this.memory = memory;
     this.connected = true;
     this.localAddr = '1.0.1';
   }
@@ -64,6 +68,36 @@ class FakeMemoryDevice extends KnxConnection {
   }
   disconnect(): void {
     this.connected = false;
+  }
+}
+
+// Like FakeMemoryDevice, but deliberately echoes the WRONG address in every
+// response — used to prove readMemory rejects a mismatched Memory_Response
+// instead of copying it into the wrong offset.
+class MisaddressingDevice extends FakeMemoryDevice {
+  sendCEMI(cemi: Buffer): Promise<void> {
+    this.sent.push(cemi);
+    const frame = parseCEMI(cemi);
+    if (frame && frame.apciName === 'Memory_Read') {
+      const count = frame.apdu[1]! & 0x3f;
+      const reqAddr = (frame.apduData[0]! << 8) | frame.apduData[1]!;
+      const badAddr = (reqAddr + 1) & 0xffff; // off-by-one, wrong on purpose
+      const word = (TPCI.DATA_CONNECTED << 10) | (9 << 6) | count;
+      const respApdu = Buffer.concat([
+        Buffer.from([
+          (word >> 8) & 0xff,
+          word & 0xff,
+          (badAddr >> 8) & 0xff,
+          badAddr & 0xff,
+        ]),
+        Buffer.alloc(count),
+      ]);
+      const resp = parseCEMI(
+        buildCEMI('1.1.4', this.localAddr, respApdu, false),
+      )!;
+      setImmediate(() => this._onCEMI(resp));
+    }
+    return Promise.resolve();
   }
 }
 
@@ -111,6 +145,17 @@ describe('parseMemoryResponse', () => {
     assert.ok(frame);
     const parsed = parseMemoryResponse(frame);
     assert.equal(parsed.address, 0x0060);
+    assert.deepEqual([...parsed.data], [0x01, 0x02]);
+  });
+
+  it('clamps a count that exceeds the actual payload (short/malformed response)', () => {
+    // count field claims 5 bytes but only 2 are present after the address.
+    const apdu = Buffer.from([0x42, 0x45, 0x00, 0x60, 0x01, 0x02]);
+    const frame = parseCEMI(buildCEMI('1.1.4', '0.0.1', apdu, false));
+    assert.ok(frame);
+    const parsed = parseMemoryResponse(frame);
+    assert.equal(parsed.address, 0x0060);
+    // Must not fabricate bytes: return only what the payload actually holds.
     assert.deepEqual([...parsed.data], [0x01, 0x02]);
   });
 });
@@ -173,5 +218,38 @@ describe('KnxConnection.readMemory', () => {
       .map((c) => parseCEMI(c))
       .filter((f) => f && f.apciName === 'Memory_Read');
     assert.equal(reads.length, 3);
+  });
+
+  it('rejects a Memory_Response whose address does not match the request', async () => {
+    const mem = Buffer.alloc(0x0200);
+    for (let i = 0; i < mem.length; i++) mem[i] = i & 0xff;
+    // Device echoes a wrong address (off by one) — must never be copied blindly.
+    const dev = new MisaddressingDevice('1.1.4', mem);
+    await assert.rejects(
+      dev.readMemory('1.1.4', 0x0100, 8, 8),
+      /address mismatch/,
+    );
+  });
+
+  it('readMemoryMany reads every region in one management session', async () => {
+    const mem = Buffer.alloc(0x0200);
+    for (let i = 0; i < mem.length; i++) mem[i] = i & 0xff;
+    const dev = new FakeMemoryDevice('1.1.4', mem);
+
+    const [a, b] = await dev.readMemoryMany(
+      '1.1.4',
+      [
+        { address: 0x0100, length: 4 },
+        { address: 0x0180, length: 3 },
+      ],
+      8,
+    );
+    assert.deepEqual([...a!], [...mem.slice(0x0100, 0x0104)]);
+    assert.deepEqual([...b!], [...mem.slice(0x0180, 0x0183)]);
+    // Both regions are read inside ONE management session: exactly one CONNECT
+    // and one DISCONNECT for the whole batch (not one pair per region).
+    const parsed = dev.sent.map((c) => parseCEMI(c));
+    assert.equal(parsed.filter((f) => f?.tpciType === 'CONNECT').length, 1);
+    assert.equal(parsed.filter((f) => f?.tpciType === 'DISCONNECT').length, 1);
   });
 });

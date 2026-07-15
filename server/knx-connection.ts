@@ -294,7 +294,11 @@ export class KnxConnection extends EventEmitter {
     const ackHandler = (cemi: CemiFrame): void => {
       if (cemi.src !== deviceAddr || cemi.tpciType !== 'DATA_CONNECTED') return;
       const rxSeq = (cemi.apdu[0]! >> 2) & 0xf;
-      void sendControl(TPCI.ACK, rxSeq);
+      // Fire-and-forget the T_Ack, but swallow a failed send (e.g. a KNXnet/IP
+      // ACK timeout on a flaky link) so it never becomes an unhandled promise
+      // rejection that crashes the process. The awaiting read/verify surfaces
+      // the failure through its own waitResponse timeout.
+      sendControl(TPCI.ACK, rxSeq).catch(() => {});
     };
     this.on('_mgmt', ackHandler);
 
@@ -388,24 +392,81 @@ export class KnxConnection extends EventEmitter {
     chunkSize: number = 12,
   ): Promise<Buffer> {
     if (!this.connected) throw new Error('Not connected');
+    let out: Buffer = Buffer.alloc(length);
+    await this.managementSession(deviceAddr, async (fns) => {
+      out = await this.readRegionInSession(
+        fns,
+        deviceAddr,
+        address,
+        length,
+        chunkSize,
+      );
+    });
+    return out;
+  }
+
+  /**
+   * Read several memory regions of one device inside a SINGLE management
+   * session (one Connect/Disconnect for the whole batch), rather than opening
+   * a fresh connection-oriented session per region. Mirrors how a real
+   * download drives all of a device's transfers over one session. Returns one
+   * Buffer per requested region, in order.
+   */
+  async readMemoryMany(
+    deviceAddr: string,
+    regions: Array<{ address: number; length: number }>,
+    chunkSize: number = 12,
+  ): Promise<Buffer[]> {
+    if (!this.connected) throw new Error('Not connected');
+    const results: Buffer[] = [];
+    await this.managementSession(deviceAddr, async (fns) => {
+      for (const r of regions)
+        results.push(
+          await this.readRegionInSession(
+            fns,
+            deviceAddr,
+            r.address,
+            r.length,
+            chunkSize,
+          ),
+        );
+    });
+    return results;
+  }
+
+  /**
+   * Read one memory region using an already-open management session. The
+   * device echoes the requested address in every A_Memory_Response; we reject
+   * any response whose address does not match the chunk we asked for, so a
+   * stale or reordered response can never be copied into the wrong offset of
+   * the read-back buffer.
+   */
+  private async readRegionInSession(
+    fns: ManagementSessionFns,
+    deviceAddr: string,
+    address: number,
+    length: number,
+    chunkSize: number,
+  ): Promise<Buffer> {
+    const { waitResponse, nextSeq } = fns;
     const out = Buffer.alloc(length);
-    await this.managementSession(
-      deviceAddr,
-      async ({ waitResponse, nextSeq }) => {
-        for (let off = 0; off < length; off += chunkSize) {
-          const n = Math.min(chunkSize, length - off);
-          const seq = nextSeq();
-          const apdu = apduMemoryRead(seq, n, address + off);
-          const respP = waitResponse('Memory_Response', 3000);
-          await this.sendCEMI(
-            buildCEMI(this.localAddr, deviceAddr, apdu, false),
-          );
-          const frame = await respP;
-          const { data } = parseMemoryResponse(frame);
-          data.copy(out, off);
-        }
-      },
-    );
+    for (let off = 0; off < length; off += chunkSize) {
+      const n = Math.min(chunkSize, length - off);
+      const seq = nextSeq();
+      const wantAddr = (address + off) & 0xffff;
+      const apdu = apduMemoryRead(seq, n, wantAddr);
+      const respP = waitResponse('Memory_Response', 3000);
+      await this.sendCEMI(buildCEMI(this.localAddr, deviceAddr, apdu, false));
+      const frame = await respP;
+      const { address: gotAddr, data } = parseMemoryResponse(frame);
+      if (gotAddr !== wantAddr)
+        throw new Error(
+          `Memory_Response address mismatch: requested 0x${wantAddr.toString(
+            16,
+          )}, device answered 0x${gotAddr.toString(16)}`,
+        );
+      data.copy(out, off);
+    }
     return out;
   }
 
@@ -421,26 +482,46 @@ export class KnxConnection extends EventEmitter {
     objIdx: number,
     propId: number,
   ): Promise<Buffer> {
+    const [value] = await this.readPropertyMany(deviceAddr, [
+      { objIdx, propId },
+    ]);
+    return value ?? Buffer.alloc(0);
+  }
+
+  /**
+   * Read several interface-object property values of one device inside a
+   * SINGLE management session. Returns one VALUE buffer per read (the 4-byte
+   * response header stripped), in order.
+   */
+  async readPropertyMany(
+    deviceAddr: string,
+    reads: Array<{ objIdx: number; propId: number }>,
+  ): Promise<Buffer[]> {
     if (!this.connected) throw new Error('Not connected');
-    let value = Buffer.alloc(0);
+    const values: Buffer[] = [];
     await this.managementSession(
       deviceAddr,
       async ({ waitResponse, nextSeq }) => {
-        const seq = nextSeq();
-        const apdu = apduPropertyValueRead(seq, objIdx, propId);
-        const respP = waitResponse('OTHER', 3000);
-        await this.sendCEMI(buildCEMI(this.localAddr, deviceAddr, apdu, false));
-        const res = await respP;
-        const data = res?.apduData;
-        if (!data)
-          throw new Error(
-            `No PropertyValue_Response for obj=${objIdx} pid=${propId}`,
+        for (const { objIdx, propId } of reads) {
+          const seq = nextSeq();
+          const apdu = apduPropertyValueRead(seq, objIdx, propId);
+          const respP = waitResponse('OTHER', 3000);
+          await this.sendCEMI(
+            buildCEMI(this.localAddr, deviceAddr, apdu, false),
           );
-        value =
-          data.length > 4 ? Buffer.from(data.subarray(4)) : Buffer.alloc(0);
+          const res = await respP;
+          const data = res?.apduData;
+          if (!data)
+            throw new Error(
+              `No PropertyValue_Response for obj=${objIdx} pid=${propId}`,
+            );
+          values.push(
+            data.length > 4 ? Buffer.from(data.subarray(4)) : Buffer.alloc(0),
+          );
+        }
       },
     );
-    return value;
+    return values;
   }
 
   /**

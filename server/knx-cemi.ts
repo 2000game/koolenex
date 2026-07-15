@@ -278,10 +278,13 @@ export function parseCEMI(buf: Buffer, off: number = 0): CemiFrame | null {
     else if ((tpciBits & 0x30) === 0x20) tpciType = 'CONTROL';
     else tpciType = 'ACK';
   } else if (apdu.length === 1) {
-    const tpciBits = (apdu[0]! >> 2) & 0x3f;
-    if ((tpciBits & 0x30) === 0x20)
-      tpciType = tpciBits === TPCI.CONNECT ? 'CONNECT' : 'DISCONNECT';
-    else if ((tpciBits & 0x30) === 0x30) tpciType = 'ACK';
+    // Control PDUs: T_Connect=0x80 and T_Disconnect=0x81 differ only in bit 0,
+    // which a `>> 2` would discard — match the whole byte. T_Ack/T_Nak carry
+    // the sequence in bits 5-2 with 0b11xxxx10/11 framing.
+    const b = apdu[0]!;
+    if (b === 0x80) tpciType = 'CONNECT';
+    else if (b === 0x81) tpciType = 'DISCONNECT';
+    else if ((b & 0xc0) === 0xc0) tpciType = 'ACK';
   }
 
   return {
@@ -306,8 +309,11 @@ export interface MemoryResponse {
 
 /** Decode an A_Memory_Response CemiFrame into { address, data }. */
 export function parseMemoryResponse(frame: CemiFrame): MemoryResponse {
-  const count = frame.apdu[1]! & 0x3f;
-  const address = (frame.apduData[0]! << 8) | frame.apduData[1]!;
+  const declaredCount = (frame.apdu[1] ?? 0) & 0x3f;
+  const address = ((frame.apduData[0] ?? 0) << 8) | (frame.apduData[1] ?? 0);
+  // Never trust the declared count past what the payload actually carries — a
+  // malformed/short response must yield the bytes present, not a longer slice.
+  const count = Math.min(declaredCount, Math.max(0, frame.apduData.length - 2));
   const data = frame.apduData.slice(2, 2 + count);
   return { address, data };
 }

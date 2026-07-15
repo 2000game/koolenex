@@ -834,16 +834,20 @@ export function buildAppIndex(buf: Buffer): AppIndex | null {
       let uOffset = parseInt(attr(u, 'Offset'), 10);
       let uBitOffset = parseInt(attr(u, 'BitOffset'), 10) || 0;
       let uFromMem = false;
-      if (isNaN(uOffset) || uOffset === 0) {
-        const uMem = Array.isArray(u.Memory) ? u.Memory[0] : u.Memory;
-        if (uMem) {
+      // The Union's <Memory> child can supply the byte offset, the bit offset,
+      // or both. Read it whenever present so a Union that carries its BitOffset
+      // in <Memory> is not dropped just because its byte Offset happens to be a
+      // direct (nonzero) attribute.
+      const uMem = Array.isArray(u.Memory) ? u.Memory[0] : u.Memory;
+      if (uMem) {
+        const memBitOff = parseInt(attr(uMem, 'BitOffset'), 10);
+        if (!isNaN(memBitOff)) uBitOffset = memBitOff;
+        if (isNaN(uOffset) || uOffset === 0) {
           const memOff = parseInt(attr(uMem, 'Offset'), 10);
-          const memBitOff = parseInt(attr(uMem, 'BitOffset'), 10);
           if (!isNaN(memOff)) {
             uOffset = memOff;
             uFromMem = true;
           }
-          if (!isNaN(memBitOff)) uBitOffset = memBitOff;
         }
       }
       if (isNaN(uOffset)) uOffset = 0;

@@ -623,11 +623,19 @@ router.post('/bus/read-memory', async (req: Request, res: Response) => {
   if (!b) return;
   const body = validateBody(
     req,
-    z.object({
-      deviceAddress: z.string().min(1),
-      address: z.number().int().min(0).max(0xffff),
-      length: z.number().int().min(1).max(4096),
-    }),
+    z
+      .object({
+        deviceAddress: z.string().min(1),
+        address: z.number().int().min(0).max(0xffff),
+        length: z.number().int().min(1).max(4096),
+      })
+      // A_Memory_Read carries a 16-bit address; reads must not run past the top
+      // of the address space, or `address + off` would wrap and return bytes
+      // from a different (low) region under the requested high addresses.
+      .refine((v) => v.address + v.length <= 0x10000, {
+        message: 'address + length exceeds the 16-bit memory space (0x10000)',
+        path: ['length'],
+      }),
   );
   const { deviceAddress, address, length } = body;
   if (!b.connected) return res.status(409).json({ error: 'Not connected' });
@@ -898,6 +906,11 @@ router.post('/bus/verify-device', async (req: Request, res: Response) => {
   //   absmem — each AbsSegment memory transfer becomes a memory read/diff;
   //   relmem — each WriteRelMem segment becomes a paramMem read/diff;
   //   prop   — property-configured devices (no image) become property reads.
+  //
+  // Note: memory reads use the legacy A_Memory_Read service. System B / System 7
+  // devices that answer only A_MemoryExtended_Read are not auto-detected here —
+  // b.readMemoryExtended() exists for that path but wiring it into verify needs
+  // a mask-version/device-descriptor probe first (tracked as follow-up).
   const plan = planVerify(
     steps as PlanStep[],
     gaTable,
@@ -921,13 +934,19 @@ router.post('/bus/verify-device', async (req: Request, res: Response) => {
     let totalBytes = 0;
     let totalDiffering = 0;
 
-    for (const region of plan.mem) {
+    // Read every region/property for this device inside ONE management session
+    // (one Connect/Disconnect for the whole verify), instead of churning a
+    // fresh connection-oriented session per read.
+    const memActuals = plan.mem.length
+      ? await b.readMemoryMany(
+          deviceAddress,
+          plan.mem.map((r) => ({ address: r.addr, length: r.expected.length })),
+        )
+      : [];
+    for (let i = 0; i < plan.mem.length; i++) {
+      const region = plan.mem[i]!;
       const expected = region.expected;
-      const actual = await b.readMemory(
-        deviceAddress,
-        region.addr,
-        expected.length,
-      );
+      const actual = memActuals[i] ?? Buffer.alloc(0);
       const diff = diffMemory(expected, actual, region.addr);
       totalBytes += diff.total;
       totalDiffering += diff.differing;
@@ -943,8 +962,15 @@ router.post('/bus/verify-device', async (req: Request, res: Response) => {
       });
     }
 
-    for (const p of plan.props) {
-      const actual = await b.readProperty(deviceAddress, p.obj, p.pid);
+    const propActuals = plan.props.length
+      ? await b.readPropertyMany(
+          deviceAddress,
+          plan.props.map((p) => ({ objIdx: p.obj, propId: p.pid })),
+        )
+      : [];
+    for (let i = 0; i < plan.props.length; i++) {
+      const p = plan.props[i]!;
+      const actual = propActuals[i] ?? Buffer.alloc(0);
       // Compare over the length ETS supplies as the expected value; the device
       // may return a longer property array than the compared prefix.
       const cmpLen = Math.min(p.expected.length, actual.length);

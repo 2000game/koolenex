@@ -103,4 +103,44 @@ describe('ets-app.ts: Union <Memory BitOffset> propagation', () => {
     assert.equal(entry.offset, 10);
     assert.equal(entry.bitOffset, 0);
   });
+
+  it('honors a Union <Memory BitOffset> even when the byte Offset is a direct Union attribute', () => {
+    // The Union carries its byte Offset as a direct attribute (29) but its bit
+    // position only in the <Memory BitOffset="4"> child. The BitOffset must
+    // still be picked up — otherwise the 4-bit field lands in the wrong nibble.
+    const xml = `<?xml version="1.0" encoding="utf-8"?>
+<KNX>
+  <ManufacturerData>
+    <Manufacturer>
+      <ApplicationPrograms>
+        <ApplicationProgram Id="AP-3">
+          <Static>
+            <ParameterTypes>
+              <ParameterType Id="PT-3">
+                <TypeNumber SizeInBit="4" />
+              </ParameterType>
+            </ParameterTypes>
+            <Parameters>
+              <Union SizeInBit="4" Offset="29">
+                <Memory BitOffset="4" />
+                <Parameter Id="P-3" ParameterType="PT-3" Value="2" Text="Union field" Offset="0" BitOffset="0" />
+              </Union>
+            </Parameters>
+            <ParameterRefs>
+              <ParameterRef Id="PR-3" RefId="P-3" />
+            </ParameterRefs>
+          </Static>
+        </ApplicationProgram>
+      </ApplicationPrograms>
+    </Manufacturer>
+  </ManufacturerData>
+</KNX>`;
+    const idx = buildAppIndex(Buffer.from(xml, 'utf8'));
+    assert(idx, 'buildAppIndex should parse the synthetic app XML');
+    const model = idx!.buildParamModel();
+    const entry = model.paramMemLayout['PR-3'];
+    assert(entry, 'PR-3 should be present in paramMemLayout');
+    assert.equal(entry.offset, 29);
+    assert.equal(entry.bitOffset, 4);
+  });
 });
