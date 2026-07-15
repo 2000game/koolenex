@@ -15,12 +15,22 @@ import {
   apduGroupWrite,
   apduConnected,
   apduControl,
+  apduMemoryRead,
+  parseMemoryResponse,
+  apduMemoryExtendedRead,
+  parseMemoryExtendedResponse,
   apduPropertyValueWrite,
   apduPropertyValueRead,
   encodePhysical,
   eventType,
   type CemiFrame,
 } from './knx-cemi.ts';
+import {
+  planDownload,
+  isAbsSegmentProcedure,
+  type PlanStep,
+  type AbsSegSeed,
+} from './knx-download-plan.ts';
 
 // Re-export from knx-dpt.ts
 export { encodeDpt, decodeDptBuffer } from './knx-dpt.ts';
@@ -76,12 +86,22 @@ export interface DownloadStep {
   data?: Buffer;
   size?: number;
   offset?: number;
+  // AbsoluteSegment (MDT-style) load-procedure fields — see knx-download-plan.ts
+  lsmIdx?: number;
+  address?: number;
 }
 
 export interface DownloadProgress {
   msg: string;
   pct?: number;
   done?: boolean;
+}
+
+/** Extra context needed to plan an AbsoluteSegment (MDT-style) download. */
+export interface DownloadExtra {
+  paramBase?: number | null;
+  absSegData?: Record<number, AbsSegSeed>;
+  appId?: string;
 }
 
 // ── Device info type ───────────────────────────────────────────────────────────
@@ -267,12 +287,24 @@ export class KnxConnection extends EventEmitter {
         this.on('_mgmt', handler);
       });
 
+    // Connection-oriented transport requires us to T_Ack every numbered data
+    // frame the device sends (its responses), before issuing the next request —
+    // otherwise the peer desyncs and stops responding after the first exchange.
+    // (Confirmed against ETS's own bus trace, which acks each device response.)
+    const ackHandler = (cemi: CemiFrame): void => {
+      if (cemi.src !== deviceAddr || cemi.tpciType !== 'DATA_CONNECTED') return;
+      const rxSeq = (cemi.apdu[0]! >> 2) & 0xf;
+      void sendControl(TPCI.ACK, rxSeq);
+    };
+    this.on('_mgmt', ackHandler);
+
     await sendControl(TPCI.CONNECT);
     await delay(100);
 
     try {
       await fn({ sendData, waitResponse, nextSeq: () => seq++ });
     } finally {
+      this.off('_mgmt', ackHandler);
       try {
         await sendControl(TPCI.DISCONNECT);
       } catch (_) {}
@@ -344,6 +376,110 @@ export class KnxConnection extends EventEmitter {
 
   // ── Application download ──────────────────────────────────────────────────────
 
+  /**
+   * Read `length` bytes of device memory starting at `address`, over the bus.
+   * Non-destructive: issues A_Memory_Read requests only. Used by the read-first
+   * validation flow to compare a device's actual memory against a computed image.
+   */
+  async readMemory(
+    deviceAddr: string,
+    address: number,
+    length: number,
+    chunkSize: number = 12,
+  ): Promise<Buffer> {
+    if (!this.connected) throw new Error('Not connected');
+    const out = Buffer.alloc(length);
+    await this.managementSession(
+      deviceAddr,
+      async ({ waitResponse, nextSeq }) => {
+        for (let off = 0; off < length; off += chunkSize) {
+          const n = Math.min(chunkSize, length - off);
+          const seq = nextSeq();
+          const apdu = apduMemoryRead(seq, n, address + off);
+          const respP = waitResponse('Memory_Response', 3000);
+          await this.sendCEMI(
+            buildCEMI(this.localAddr, deviceAddr, apdu, false),
+          );
+          const frame = await respP;
+          const { data } = parseMemoryResponse(frame);
+          data.copy(out, off);
+        }
+      },
+    );
+    return out;
+  }
+
+  /**
+   * Read a single interface-object property value (A_PropertyValue_Read).
+   * Non-destructive. Returns the property VALUE bytes only — the 4-byte
+   * response header (objIdx, propId, count, startIndex) is stripped. Used by
+   * read-back verification of property-configured devices (e.g. KNX IP
+   * routers) that carry no downloadable parameter-memory image.
+   */
+  async readProperty(
+    deviceAddr: string,
+    objIdx: number,
+    propId: number,
+  ): Promise<Buffer> {
+    if (!this.connected) throw new Error('Not connected');
+    let value = Buffer.alloc(0);
+    await this.managementSession(
+      deviceAddr,
+      async ({ waitResponse, nextSeq }) => {
+        const seq = nextSeq();
+        const apdu = apduPropertyValueRead(seq, objIdx, propId);
+        const respP = waitResponse('OTHER', 3000);
+        await this.sendCEMI(buildCEMI(this.localAddr, deviceAddr, apdu, false));
+        const res = await respP;
+        const data = res?.apduData;
+        if (!data)
+          throw new Error(
+            `No PropertyValue_Response for obj=${objIdx} pid=${propId}`,
+          );
+        value =
+          data.length > 4 ? Buffer.from(data.subarray(4)) : Buffer.alloc(0);
+      },
+    );
+    return value;
+  }
+
+  /**
+   * Read device memory using the extended memory services (A_MemoryExtended_Read,
+   * 0x1FD) — required by System B / System 7 devices, which do not answer the
+   * legacy A_Memory_Read. Non-destructive. 24-bit address space.
+   */
+  async readMemoryExtended(
+    deviceAddr: string,
+    address: number,
+    length: number,
+    chunkSize: number = 11,
+  ): Promise<Buffer> {
+    if (!this.connected) throw new Error('Not connected');
+    const out = Buffer.alloc(length);
+    await this.managementSession(
+      deviceAddr,
+      async ({ waitResponse, nextSeq }) => {
+        for (let off = 0; off < length; off += chunkSize) {
+          const n = Math.min(chunkSize, length - off);
+          const seq = nextSeq();
+          const apdu = apduMemoryExtendedRead(seq, n, address + off);
+          const respP = waitResponse('MemoryExtended_Read_Response', 3000);
+          await this.sendCEMI(
+            buildCEMI(this.localAddr, deviceAddr, apdu, false),
+          );
+          const frame = await respP;
+          const { returnCode, data } = parseMemoryExtendedResponse(frame);
+          if (returnCode !== 0)
+            throw new Error(
+              `MemoryExtended read error rc=${returnCode} at 0x${(address + off).toString(16)}`,
+            );
+          data.copy(out, off);
+        }
+      },
+    );
+    return out;
+  }
+
   async downloadDevice(
     deviceAddr: string,
     steps: DownloadStep[],
@@ -351,12 +487,89 @@ export class KnxConnection extends EventEmitter {
     assocTable: Buffer | null,
     paramMem: Buffer | null,
     onProgress?: (progress: DownloadProgress) => void,
+    extra?: DownloadExtra,
   ): Promise<void> {
     if (!this.connected) throw new Error('Not connected');
 
     const log = (msg: string): void => {
       if (onProgress) onProgress({ msg });
     };
+
+    // AbsoluteSegment (MDT-style) load procedures — Connect/Unload/Load/
+    // AbsSegment/TaskSegment/LoadCompleted/Restart/Disconnect — are planned
+    // by the pure planDownload() function (see knx-download-plan.ts) and
+    // this executor just replays the resulting ops as CEMI frames. Legacy
+    // RelSegment/WriteRelMem/LoadImageProp (ABB-style) devices keep using
+    // the inline loop below unchanged.
+    if (isAbsSegmentProcedure(steps)) {
+      await this.managementSession(deviceAddr, async ({ nextSeq }) => {
+        const MEM_CHUNK = 44;
+
+        const ops = planDownload(
+          steps as PlanStep[],
+          gaTable,
+          assocTable,
+          paramMem,
+          extra?.paramBase ?? null,
+          extra?.absSegData ?? {},
+          extra?.appId ?? '',
+        );
+
+        for (const op of ops) {
+          switch (op.kind) {
+            case 'connect':
+            case 'disconnect': {
+              // The connection-oriented session is already opened/closed by
+              // managementSession() around this whole download; nothing to
+              // send here.
+              log(op.kind === 'connect' ? 'Connect' : 'Disconnect');
+              break;
+            }
+            case 'propWrite': {
+              log(`PropWrite ObjIdx=${op.obj} PropId=${op.pid}`);
+              const seq = nextSeq();
+              const apdu = apduPropertyValueWrite(seq, op.obj, op.pid, op.data);
+              const cemi = buildCEMI(this.localAddr, deviceAddr, apdu, false);
+              await this.sendCEMI(cemi);
+              await delay(50);
+              break;
+            }
+            case 'memWrite': {
+              log(
+                `MemWrite Addr=0x${op.addr.toString(16)} Len=${op.bytes.length}`,
+              );
+              for (let off = 0; off < op.bytes.length; off += MEM_CHUNK) {
+                const chunk = op.bytes.subarray(off, off + MEM_CHUNK);
+                const addr = op.addr + off;
+                const seq = nextSeq();
+                const chunkExtra = Buffer.concat([
+                  Buffer.from([chunk.length, (addr >> 8) & 0xff, addr & 0xff]),
+                  chunk,
+                ]);
+                const apdu = apduConnected(seq, 'Memory_Write', chunkExtra);
+                const cemi = buildCEMI(this.localAddr, deviceAddr, apdu, false);
+                await this.sendCEMI(cemi);
+                await delay(30);
+              }
+              break;
+            }
+            case 'restart': {
+              log('Restart');
+              const seq = nextSeq();
+              const apdu = apduConnected(seq, 'Restart');
+              const cemi = buildCEMI(this.localAddr, deviceAddr, apdu, false);
+              await this.sendCEMI(cemi);
+              break;
+            }
+          }
+        }
+
+        log('Download complete');
+        if (onProgress)
+          onProgress({ msg: 'Download complete', pct: 100, done: true });
+      });
+      return;
+    }
 
     await this.managementSession(deviceAddr, async ({ nextSeq }) => {
       const MEM_CHUNK = 10;
@@ -393,7 +606,7 @@ export class KnxConnection extends EventEmitter {
             for (let off = 0; off < mem.length; off += MEM_CHUNK) {
               const chunk = mem.slice(off, off + MEM_CHUNK);
               const seq = nextSeq();
-              const extra = Buffer.concat([
+              const extra2 = Buffer.concat([
                 Buffer.from([
                   chunk.length,
                   ((step.offset! + off) >> 8) & 0xff,
@@ -401,7 +614,7 @@ export class KnxConnection extends EventEmitter {
                 ]),
                 chunk,
               ]);
-              const apdu = apduConnected(seq, 'Memory_Write', extra);
+              const apdu = apduConnected(seq, 'Memory_Write', extra2);
               const cemi = buildCEMI(this.localAddr, deviceAddr, apdu, false);
               await this.sendCEMI(cemi);
               await delay(30);

@@ -9,7 +9,21 @@ export const APCI_EXT = {
   PropertyValue_Read: 0x03d5,
   PropertyValue_Response: 0x03d6,
   PropertyValue_Write: 0x03d7,
+  // Extended memory services (System B / System 7 devices; share the ADC 4-bit
+  // group and are disambiguated by exact 10-bit match).
+  MemoryExtended_Write: 0x01fb,
+  MemoryExtended_Write_Response: 0x01fc,
+  MemoryExtended_Read: 0x01fd,
+  MemoryExtended_Read_Response: 0x01fe,
 } as const;
+
+// 10-bit extended APCIs that need exact-match decoding (name by full code).
+const APCI_EXT_NAMES: Record<number, string> = {
+  0x01fb: 'MemoryExtended_Write',
+  0x01fc: 'MemoryExtended_Write_Response',
+  0x01fd: 'MemoryExtended_Read',
+  0x01fe: 'MemoryExtended_Read_Response',
+};
 
 // CEMI message codes
 export const MC = { REQ: 0x11, IND: 0x29, CON: 0x2e } as const;
@@ -148,12 +162,42 @@ export function apduPropertyValueRead(
   return apduConnectedFull(seq, APCI_EXT.PropertyValue_Read, meta);
 }
 
+export function apduMemoryRead(
+  seq: number,
+  count: number,
+  address: number,
+): Buffer {
+  // APCI Memory_Read = 0b1000; the 6-bit byte count sits in octet7[5:0].
+  const fullApci = (APCI.Memory_Read! << 6) | (count & 0x3f);
+  const addr = Buffer.from([(address >> 8) & 0xff, address & 0xff]);
+  return apduConnectedFull(seq, fullApci, addr);
+}
+
+export function apduMemoryExtendedRead(
+  seq: number,
+  count: number,
+  address: number,
+): Buffer {
+  // A_MemoryExtended_Read (0x1FD): [count(1)] + [address(3, big-endian)].
+  const extra = Buffer.from([
+    count & 0xff,
+    (address >> 16) & 0xff,
+    (address >> 8) & 0xff,
+    address & 0xff,
+  ]);
+  return apduConnectedFull(seq, APCI_EXT.MemoryExtended_Read, extra);
+}
+
 export function apduControl(tpciCode: number, seq: number = 0): Buffer {
-  const tpci =
-    tpciCode === TPCI.ACK || tpciCode === TPCI.NAK
-      ? tpciCode + (seq & 0xf)
-      : tpciCode;
-  return Buffer.from([tpci << 2]);
+  // Control PDU octet: T_Connect=0x80, T_Disconnect=0x81,
+  // T_Ack=0b11 SSSS 10, T_Nak=0b11 SSSS 11 (the low 2 bits mark the PDU type).
+  let b: number;
+  if (tpciCode === TPCI.CONNECT) b = 0x80;
+  else if (tpciCode === TPCI.DISCONNECT) b = 0x81;
+  else if (tpciCode === TPCI.ACK) b = 0xc2 | ((seq & 0xf) << 2);
+  else if (tpciCode === TPCI.NAK) b = 0xc3 | ((seq & 0xf) << 2);
+  else b = (tpciCode << 2) & 0xff;
+  return Buffer.from([b]);
 }
 
 // ── CEMI frame builder ─────────────────────────────────────────────────────────
@@ -220,6 +264,14 @@ export function parseCEMI(buf: Buffer, off: number = 0): CemiFrame | null {
     apciIdx = ((apdu[0]! & 0x03) << 2) | ((apdu[1]! & 0xc0) >> 6);
     apciName = APCI_NAMES[apciIdx] || 'OTHER';
     apduData = apdu.length > 2 ? apdu.slice(2) : Buffer.from([apdu[1]! & 0x3f]);
+    // Extended 10-bit APCIs (e.g. MemoryExtended) overlap the ADC 4-bit group;
+    // resolve by exact full-code match and keep the whole payload as apduData.
+    const fullApci = ((apdu[0]! & 0x03) << 8) | apdu[1]!;
+    if (APCI_EXT_NAMES[fullApci]) {
+      apciName = APCI_EXT_NAMES[fullApci]!;
+      apciIdx = fullApci;
+      apduData = apdu.slice(2);
+    }
     const tpciBits = (apdu[0]! >> 2) & 0x3f;
     if ((tpciBits & 0x30) === 0x00) tpciType = 'DATA_GROUP';
     else if ((tpciBits & 0x30) === 0x10) tpciType = 'DATA_CONNECTED';
@@ -243,6 +295,41 @@ export function parseCEMI(buf: Buffer, off: number = 0): CemiFrame | null {
     apdu,
     tpciType,
   };
+}
+
+// ── A_Memory_Response parsing ────────────────────────────────────────────────
+
+export interface MemoryResponse {
+  address: number;
+  data: Buffer;
+}
+
+/** Decode an A_Memory_Response CemiFrame into { address, data }. */
+export function parseMemoryResponse(frame: CemiFrame): MemoryResponse {
+  const count = frame.apdu[1]! & 0x3f;
+  const address = (frame.apduData[0]! << 8) | frame.apduData[1]!;
+  const data = frame.apduData.slice(2, 2 + count);
+  return { address, data };
+}
+
+export interface MemoryExtendedResponse {
+  returnCode: number;
+  address: number;
+  data: Buffer;
+}
+
+/**
+ * Decode an A_MemoryExtended_Read_Response (System B / System 7).
+ * Payload: [return_code(1)][address(3, big-endian)][data...]. returnCode 0 = OK.
+ */
+export function parseMemoryExtendedResponse(
+  frame: CemiFrame,
+): MemoryExtendedResponse {
+  const d = frame.apduData;
+  const returnCode = d[0]!;
+  const address = (d[1]! << 16) | (d[2]! << 8) | d[3]!;
+  const data = d.slice(4);
+  return { returnCode, address, data };
 }
 
 // ── Event type from APCI ───────────────────────────────────────────────────────

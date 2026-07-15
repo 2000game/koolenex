@@ -141,3 +141,9 @@
   composes: logEntry;
   color: var(--muted);
 }
+
+.rowActions {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}

@@ -322,6 +322,25 @@ export const api = {
       deviceId,
     }),
 
+  // Read-only: compare a device's actual memory to the computed image (no writes)
+  busVerifyDevice: (
+    deviceAddress: string,
+    projectId: number,
+    deviceId: number,
+  ) =>
+    req<{
+      deviceAddress: string;
+      match: boolean;
+      totalBytes: number;
+      totalDiffering: number;
+      segments: Array<{
+        offset: number;
+        size: number;
+        matching: number;
+        differing: number;
+      }>;
+    }>('POST', '/bus/verify-device', { deviceAddress, projectId, deviceId }),
+
   // Settings
   getSettings: () => req<Setting[]>('GET', '/settings'),
   saveSettings: (body: Record<string, string>) =>

@@ -12,6 +12,7 @@ import {
   buildAssocTable,
   resolveParamSegment,
   buildParamMem,
+  diffMemory,
 } from './knx-tables.ts';
 import type {
   Setting,
@@ -23,6 +24,8 @@ import type {
 } from '../../shared/types.ts';
 import type KnxBusManager from '../knx-bus.ts';
 import type { DownloadStep, DownloadProgress } from '../knx-connection.ts';
+import { planVerify } from '../knx-download-plan.ts';
+import type { PlanStep } from '../knx-download-plan.ts';
 
 let bus: KnxBusManager | null = null;
 export const router = express.Router();
@@ -614,6 +617,33 @@ router.post('/bus/device-info', async (req: Request, res: Response) => {
   }
 });
 
+// Read raw device memory over the bus (non-destructive; read-first validation).
+router.post('/bus/read-memory', async (req: Request, res: Response) => {
+  const b = requireBus(res);
+  if (!b) return;
+  const body = validateBody(
+    req,
+    z.object({
+      deviceAddress: z.string().min(1),
+      address: z.number().int().min(0).max(0xffff),
+      length: z.number().int().min(1).max(4096),
+    }),
+  );
+  const { deviceAddress, address, length } = body;
+  if (!b.connected) return res.status(409).json({ error: 'Not connected' });
+  try {
+    const data = await b.readMemory(deviceAddress, address, length);
+    res.json({
+      deviceAddress,
+      address,
+      length: data.length,
+      hex: data.toString('hex'),
+    });
+  } catch (e) {
+    res.status(502).json({ error: safeError('bus', 'Memory read failed', e) });
+  }
+});
+
 // ── KNX Programming ───────────────────────────────────────────────────────────
 
 // Write individual address (device must be in programming mode)
@@ -631,67 +661,82 @@ router.post('/bus/program-ia', async (req: Request, res: Response) => {
   }
 });
 
-// Full application download for a device
-router.post('/bus/program-device', async (req: Request, res: Response) => {
-  const b = requireBus(res);
-  if (!b) return;
-  const body = validateBody(
-    req,
-    z.object({
-      deviceAddress: z.string().min(1),
-      projectId: z.number().int().optional(),
-      deviceId: z.number().int().optional(),
-    }),
-  );
-  const { deviceAddress, projectId, deviceId } = body;
-  if (!b.connected) return res.status(409).json({ error: 'Bus not connected' });
+interface DeviceModel {
+  appId?: string;
+  loadProcedures?: Array<{
+    type: string;
+    data?: string;
+    size?: number;
+    offset?: number;
+    [key: string]: unknown;
+  }>;
+  paramMemLayout?: Record<string, unknown>;
+  dynTree?: unknown;
+  params?: Record<string, unknown>;
+  absSegData?: Record<number, { size: number; hex?: string | null }>;
+}
 
-  // Load device data
-  const dev = deviceId
-    ? db.get<Device>('SELECT * FROM devices WHERE id=?', [+deviceId])
-    : db.get<Device>(
-        'SELECT * FROM devices WHERE individual_address=? AND project_id=?',
-        [deviceAddress, +(projectId ?? 0)],
-      );
-  if (!dev) return res.status(404).json({ error: 'Device not found' });
+type DeviceProgramming =
+  | {
+      ok: true;
+      steps: DownloadStep[];
+      gaTable: Buffer;
+      assocTable: Buffer;
+      paramMem: Buffer | null;
+      paramBase: number | null;
+      absSegData: Record<number, { size: number; hex?: string | null }>;
+      appId: string;
+    }
+  | { ok: false; status: number; body: Record<string, unknown> };
 
-  // Load app model (load procedures)
+/**
+ * Build the download artifacts (load-procedure steps, GA/association tables,
+ * parameter memory image) for a device from its imported app model + current
+ * parameter values. Shared by program-device (writes them) and verify-device
+ * (reads the device back and diffs against them).
+ */
+function buildDeviceProgramming(dev: Device): DeviceProgramming {
   if (!dev.app_ref)
-    return res.status(400).json({
-      error: 'no_app',
-      message:
-        'Device has no application program reference. Re-import the project.',
-    });
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'no_app',
+        message:
+          'Device has no application program reference. Re-import the project.',
+      },
+    };
   const safe = dev.app_ref.replace(/[^a-zA-Z0-9_-]/g, '_');
   const modelPath = path.join(APPS_DIR, safe + '.json');
   if (!fs.existsSync(modelPath))
-    return res.status(400).json({
-      error: 'no_model',
-      message: 'App model not found. Re-import the project.',
-    });
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'no_model',
+        message: 'App model not found. Re-import the project.',
+      },
+    };
 
-  interface AppModel {
-    loadProcedures?: Array<{
-      type: string;
-      data?: string;
-      [key: string]: unknown;
-    }>;
-    paramMemLayout?: Record<string, unknown>;
-    dynTree?: unknown;
-    params?: Record<string, unknown>;
-  }
-
-  let model: AppModel;
+  let model: DeviceModel;
   try {
-    model = JSON.parse(fs.readFileSync(modelPath, 'utf8')) as AppModel;
+    model = JSON.parse(fs.readFileSync(modelPath, 'utf8')) as DeviceModel;
   } catch {
-    return res.status(500).json({ error: 'Failed to read app model' });
+    return {
+      ok: false,
+      status: 500,
+      body: { error: 'Failed to read app model' },
+    };
   }
   if (!model.loadProcedures?.length)
-    return res.status(400).json({
-      error: 'no_ldctrl',
-      message: 'No load procedures found. Re-import the project.',
-    });
+    return {
+      ok: false,
+      status: 400,
+      body: {
+        error: 'no_ldctrl',
+        message: 'No load procedures found. Re-import the project.',
+      },
+    };
 
   // Build GA table from project data
   const coRows = db.all<ComObject>(
@@ -714,7 +759,7 @@ router.post('/bus/program-device', async (req: Request, res: Response) => {
   const assocTable = buildAssocTable(coRows, gaLinks);
 
   // Parameter memory: build from param layout + current values
-  const { paramSize, paramFill, relSegHex } = resolveParamSegment(
+  const { paramSize, paramFill, relSegHex, paramBase } = resolveParamSegment(
     model as Parameters<typeof resolveParamSegment>[0],
   );
   let paramMem: Buffer | null = null;
@@ -745,6 +790,47 @@ router.post('/bus/program-device', async (req: Request, res: Response) => {
     data: s.data ? Buffer.from(s.data, 'hex') : undefined,
   })) as DownloadStep[];
 
+  return {
+    ok: true,
+    steps,
+    gaTable,
+    assocTable,
+    paramMem,
+    paramBase,
+    absSegData: model.absSegData ?? {},
+    appId: model.appId ?? dev.app_ref,
+  };
+}
+
+// Full application download for a device
+router.post('/bus/program-device', async (req: Request, res: Response) => {
+  const b = requireBus(res);
+  if (!b) return;
+  const body = validateBody(
+    req,
+    z.object({
+      deviceAddress: z.string().min(1),
+      projectId: z.number().int().optional(),
+      deviceId: z.number().int().optional(),
+    }),
+  );
+  const { deviceAddress, projectId, deviceId } = body;
+  if (!b.connected) return res.status(409).json({ error: 'Bus not connected' });
+
+  // Load device data
+  const dev = deviceId
+    ? db.get<Device>('SELECT * FROM devices WHERE id=?', [+deviceId])
+    : db.get<Device>(
+        'SELECT * FROM devices WHERE individual_address=? AND project_id=?',
+        [deviceAddress, +(projectId ?? 0)],
+      );
+  if (!dev) return res.status(404).json({ error: 'Device not found' });
+
+  const built = buildDeviceProgramming(dev);
+  if (!built.ok) return res.status(built.status).json(built.body);
+  const { steps, gaTable, assocTable, paramMem, paramBase, absSegData, appId } =
+    built;
+
   // Stream progress via WebSocket
   const onProgress = (p: DownloadProgress): void =>
     b.broadcast('program:progress', { deviceAddress, ...p });
@@ -758,6 +844,7 @@ router.post('/bus/program-device', async (req: Request, res: Response) => {
       assocTable,
       paramMem,
       onProgress,
+      { paramBase, absSegData, appId },
     );
     db.run('UPDATE devices SET status=? WHERE id=?', ['programmed', dev.id]);
     db.scheduleSave();
@@ -773,6 +860,122 @@ router.post('/bus/program-device', async (req: Request, res: Response) => {
     res
       .status(502)
       .json({ error: safeError('bus', 'Device programming failed', e) });
+  }
+});
+
+// Read-only verification: compute the parameter-memory image for a device and
+// compare it against what the device actually has, reading over the bus. Writes
+// nothing — safe to run against a live installation.
+router.post('/bus/verify-device', async (req: Request, res: Response) => {
+  const b = requireBus(res);
+  if (!b) return;
+  const body = validateBody(
+    req,
+    z.object({
+      deviceAddress: z.string().min(1),
+      projectId: z.number().int().optional(),
+      deviceId: z.number().int().optional(),
+    }),
+  );
+  const { deviceAddress, projectId, deviceId } = body;
+  if (!b.connected) return res.status(409).json({ error: 'Bus not connected' });
+
+  const dev = deviceId
+    ? db.get<Device>('SELECT * FROM devices WHERE id=?', [+deviceId])
+    : db.get<Device>(
+        'SELECT * FROM devices WHERE individual_address=? AND project_id=?',
+        [deviceAddress, +(projectId ?? 0)],
+      );
+  if (!dev) return res.status(404).json({ error: 'Device not found' });
+
+  const built = buildDeviceProgramming(dev);
+  if (!built.ok) return res.status(built.status).json(built.body);
+  const { steps, gaTable, assocTable, paramMem, paramBase, absSegData, appId } =
+    built;
+
+  // Derive the read-back plan from the SAME artifacts the download would use.
+  // planVerify covers every device family we own:
+  //   absmem — each AbsSegment memory transfer becomes a memory read/diff;
+  //   relmem — each WriteRelMem segment becomes a paramMem read/diff;
+  //   prop   — property-configured devices (no image) become property reads.
+  const plan = planVerify(
+    steps as PlanStep[],
+    gaTable,
+    assocTable,
+    paramMem,
+    paramBase,
+    absSegData,
+    appId,
+  );
+
+  if (plan.family === 'none' || (!plan.mem.length && !plan.props.length))
+    return res.status(400).json({
+      error: 'nothing_to_verify',
+      message:
+        'Device exposes no downloadable memory image or comparable properties to verify.',
+    });
+
+  try {
+    const segments = [];
+    const props = [];
+    let totalBytes = 0;
+    let totalDiffering = 0;
+
+    for (const region of plan.mem) {
+      const expected = region.expected;
+      const actual = await b.readMemory(
+        deviceAddress,
+        region.addr,
+        expected.length,
+      );
+      const diff = diffMemory(expected, actual, region.addr);
+      totalBytes += diff.total;
+      totalDiffering += diff.differing;
+      segments.push({
+        label: region.label,
+        offset: region.addr,
+        size: expected.length,
+        matching: diff.matching,
+        differing: diff.differing,
+        chunks: diff.chunks,
+        expectedHex: expected.toString('hex'),
+        actualHex: actual.toString('hex'),
+      });
+    }
+
+    for (const p of plan.props) {
+      const actual = await b.readProperty(deviceAddress, p.obj, p.pid);
+      // Compare over the length ETS supplies as the expected value; the device
+      // may return a longer property array than the compared prefix.
+      const cmpLen = Math.min(p.expected.length, actual.length);
+      const differ =
+        actual.length < p.expected.length ||
+        !actual.subarray(0, cmpLen).equals(p.expected.subarray(0, cmpLen));
+      totalBytes += p.expected.length;
+      totalDiffering += differ ? p.expected.length : 0;
+      props.push({
+        label: p.label,
+        obj: p.obj,
+        pid: p.pid,
+        match: !differ,
+        expectedHex: p.expected.toString('hex'),
+        actualHex: actual.toString('hex'),
+      });
+    }
+
+    res.json({
+      deviceAddress,
+      family: plan.family,
+      match: totalDiffering === 0,
+      totalBytes,
+      totalDiffering,
+      segments,
+      props,
+    });
+  } catch (e) {
+    res
+      .status(502)
+      .json({ error: safeError('bus', 'Device verify failed', e) });
   }
 });
 

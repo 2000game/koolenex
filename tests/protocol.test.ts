@@ -333,24 +333,20 @@ describe('APDU: apduControl', () => {
     assert.equal(apdu[0], TPCI.CONNECT << 2);
   });
 
-  it('builds T_DISCONNECT', () => {
+  it('builds T_DISCONNECT (0x81 per KNX spec)', () => {
     const apdu = apduControl(TPCI.DISCONNECT);
     assert.equal(apdu.length, 1);
-    assert.equal(apdu[0], TPCI.DISCONNECT << 2);
+    assert.equal(apdu[0], 0x81);
   });
 
-  it('builds T_ACK with sequence number', () => {
-    const apdu = apduControl(TPCI.ACK, 7);
-    assert.equal(apdu.length, 1);
-    const tpci = (TPCI.ACK + 7) << 2;
-    assert.equal(apdu[0], tpci);
+  it('builds T_ACK with sequence number (0b11 SSSS 10)', () => {
+    // T_Ack(seq0) = 0xC2 on the wire (confirmed against ETS bus trace).
+    assert.equal(apduControl(TPCI.ACK, 0)[0], 0xc2);
+    assert.equal(apduControl(TPCI.ACK, 7)[0], 0xc2 | (7 << 2));
   });
 
-  it('builds T_NAK with sequence number', () => {
-    const apdu = apduControl(TPCI.NAK, 3);
-    assert.equal(apdu.length, 1);
-    const tpci = (TPCI.NAK + 3) << 2;
-    assert.equal(apdu[0], tpci);
+  it('builds T_NAK with sequence number (0b11 SSSS 11)', () => {
+    assert.equal(apduControl(TPCI.NAK, 3)[0], 0xc3 | (3 << 2));
   });
 });
 

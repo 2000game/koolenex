@@ -60,6 +60,26 @@ export function ProgrammingView() {
     }
   };
 
+  const verifyDevice = async (deviceId: any, devAddr: string) => {
+    setLog((l) => [
+      `[${new Date().toLocaleTimeString()}] Verifying (read-only) → ${devAddr}`,
+      ...l,
+    ]);
+    try {
+      const pid = data?.project?.id;
+      const r = await api.busVerifyDevice(devAddr, pid!, deviceId);
+      const msg = r.match
+        ? `✓ ${devAddr} — matches computed image (${r.totalBytes} bytes)`
+        : `≠ ${devAddr} — ${r.totalDiffering}/${r.totalBytes} bytes differ from computed image`;
+      setLog((l) => [`[${new Date().toLocaleTimeString()}] ${msg}`, ...l]);
+    } catch (err: any) {
+      setLog((l) => [
+        `[${new Date().toLocaleTimeString()}] ✗ ${devAddr} — verify failed: ${err.message}`,
+        ...l,
+      ]);
+    }
+  };
+
   const programmAll = () =>
     devices
       .filter((d: any) => d.status !== 'programmed')
@@ -185,22 +205,33 @@ export function ProgrammingView() {
                       )}
                     </TD>
                     <TD>
-                      <Btn
-                        onClick={() =>
-                          programDevice(d.id, d.individual_address)
-                        }
-                        disabled={prog?.state === 'running'}
-                      >
-                        {prog?.state === 'running' ? (
-                          <Spinner />
-                        ) : prog?.state === 'done' ? (
-                          'Re-program'
-                        ) : prog?.state === 'error' ? (
-                          'Retry'
-                        ) : (
-                          'Program'
-                        )}
-                      </Btn>
+                      <div className={styles.rowActions}>
+                        <Btn
+                          onClick={() =>
+                            verifyDevice(d.id, d.individual_address)
+                          }
+                          disabled={prog?.state === 'running'}
+                          title="Read the device and compare to the computed image — no writes"
+                        >
+                          Verify
+                        </Btn>
+                        <Btn
+                          onClick={() =>
+                            programDevice(d.id, d.individual_address)
+                          }
+                          disabled={prog?.state === 'running'}
+                        >
+                          {prog?.state === 'running' ? (
+                            <Spinner />
+                          ) : prog?.state === 'done' ? (
+                            'Re-program'
+                          ) : prog?.state === 'error' ? (
+                            'Retry'
+                          ) : (
+                            'Program'
+                          )}
+                        </Btn>
+                      </div>
                     </TD>
                   </tr>
                 );

@@ -106,6 +106,9 @@ function decodePhysicalRaw(buf: Buffer, off: number): string {
 // ── Local IP detection ─────────────────────────────────────────────────────────
 
 function getLocalIp(): string {
+  // Override for NAT/VPN: set KNX_LOCAL_IP=0.0.0.0 so the gateway replies to the
+  // UDP source address instead of an auto-detected (and possibly wrong) interface.
+  if (process.env.KNX_LOCAL_IP) return process.env.KNX_LOCAL_IP;
   const ifaces = os.networkInterfaces();
   for (const name of Object.keys(ifaces)) {
     for (const iface of ifaces[name]!) {
@@ -139,6 +142,8 @@ class KnxIpConnection extends (KnxConnection as new () => InstanceType<
   seqIn: number;
   _hbTimer: ReturnType<typeof setInterval> | null;
   _pendingAck: PendingAck | null;
+  _sending: boolean;
+  _sendQueue: Array<() => void>;
 
   constructor() {
     super();
@@ -152,6 +157,8 @@ class KnxIpConnection extends (KnxConnection as new () => InstanceType<
     this.seqIn = -1;
     this._hbTimer = null;
     this._pendingAck = null;
+    this._sending = false;
+    this._sendQueue = [];
   }
 
   // ── Connect ─────────────────────────────────────────────────────────────────
@@ -298,6 +305,60 @@ class KnxIpConnection extends (KnxConnection as new () => InstanceType<
   // ── Send CEMI via KNXnet/IP tunneling with ACK wait ───────────────────────────
 
   sendCEMI(cemi: Buffer, timeoutMs: number = 1000): Promise<void> {
+    // KNXnet/IP tunnelling permits only one un-acked TUNNELLING_REQUEST in
+    // flight, so sends are serialized: the first one (queue idle) runs
+    // _sendCEMIOnce synchronously — callers/tests inspect _pendingAck/seqOut
+    // right after calling sendCEMI, without awaiting a microtask. Later sends
+    // queue up and run once the prior one settles (resolve OR reject; a
+    // failed send must not deadlock the queue).
+    if (!this._sending) {
+      this._sending = true;
+      return this._startSend(cemi, timeoutMs);
+    }
+    return new Promise<void>((resolve, reject) => {
+      this._sendQueue.push(() => {
+        this._startSend(cemi, timeoutMs).then(resolve, reject);
+      });
+    });
+  }
+
+  _startSend(cemi: Buffer, timeoutMs: number): Promise<void> {
+    const result = this._sendCEMIOnce(cemi, timeoutMs);
+
+    let drained = false;
+    const drain = (): void => {
+      if (drained) return;
+      drained = true;
+      const next = this._sendQueue.shift();
+      if (next) next();
+      else this._sending = false;
+    };
+
+    // Synchronous drain hook: _onTunnelingAck (and unit tests) resolve/reject
+    // via _pendingAck directly, so wrap those callbacks to advance the queue
+    // in the same tick rather than waiting for a promise microtask.
+    if (this._pendingAck) {
+      const pending = this._pendingAck;
+      const origResolve = pending.resolve;
+      const origReject = pending.reject;
+      pending.resolve = () => {
+        drain();
+        origResolve();
+      };
+      pending.reject = (err: Error) => {
+        drain();
+        origReject(err);
+      };
+    }
+    // Safety net for settlement paths that bypass _pendingAck (the internal
+    // ACK timeout below nulls _pendingAck before rejecting). No-op if drain()
+    // already ran synchronously above.
+    result.then(drain, drain);
+
+    return result;
+  }
+
+  _sendCEMIOnce(cemi: Buffer, timeoutMs: number): Promise<void> {
     return new Promise((resolve, reject) => {
       const seq = this.seqOut;
       this.seqOut = (this.seqOut + 1) & 0xff;
