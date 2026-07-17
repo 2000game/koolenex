@@ -11,6 +11,7 @@ import assert from 'node:assert/strict';
 
 import {
   planDownload,
+  planRelmemWrites,
   isAbsSegmentProcedure,
   type PlanStep,
   type PlannedOp,
@@ -180,5 +181,29 @@ describe('planDownload synthetic behavior', () => {
     // event=3, subtype=2, addr=0x4000, 01 00, mfg LE (00AB -> AB 00), appNum
     // low byte (CDEF -> EF), version byte (99)
     assert.equal(desc!.data.toString('hex'), '030240000100ab00ef99');
+  });
+});
+
+describe('planRelmemWrites', () => {
+  const STEPS: PlanStep[] = [
+    { type: 'WriteRelMem', objIdx: 4, offset: 0, size: 5 },
+  ];
+  const PARAM = Buffer.from('0102030405', 'hex');
+
+  it('chunks param memory at base + offset', () => {
+    const ops = planRelmemWrites(STEPS, PARAM, { 4: 0x0200 }, 2);
+    assert.deepEqual(
+      ops.map((o) => o.addr),
+      [0x0200, 0x0202, 0x0204],
+    );
+    assert.equal(
+      Buffer.concat(ops.map((o) => o.bytes)).toString('hex'),
+      '0102030405',
+    );
+  });
+
+  it('falls back to base 0 when the objIdx has no resolved base', () => {
+    const ops = planRelmemWrites(STEPS, PARAM, {}, 2);
+    assert.equal(ops[0]!.addr, 0x0000);
   });
 });

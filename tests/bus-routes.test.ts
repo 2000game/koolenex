@@ -995,3 +995,60 @@ describe('POST /bus/verify-device — property-configured device', () => {
     assert.equal(body.match, false);
   });
 });
+
+// A minimal relmem device: one WriteRelMem segment on interface object 4. Used
+// to exercise the PID-7 base resolution + zero-pointer guard in program-device.
+const RELMEM_APP = 'M-00FB_A-0001-01-AB01';
+const RELMEM_MODEL = {
+  appId: RELMEM_APP,
+  loadProcedures: [
+    { type: 'RelSegment', lsmIdx: 4, size: 4 },
+    { type: 'WriteRelMem', objIdx: 4, offset: 0, size: 4 },
+  ],
+  relSegData: { '4': '00000000' },
+  paramMemLayout: {
+    [`${RELMEM_APP}_P-1_R-1`]: {
+      offset: 0,
+      bitOffset: 0,
+      bitSize: 8,
+      defaultValue: '1',
+      isText: false,
+      isFloat: false,
+      fromMemoryChild: false,
+      isVisible: true,
+    },
+  },
+  params: { [`${RELMEM_APP}_P-1_R-1`]: { defaultValue: '1' } },
+  dynTree: { main: { items: [] } },
+};
+
+describe('POST /bus/program-device — relmem zero-pointer guard', () => {
+  let projectId: number;
+  const deviceAddr = '1.1.31';
+
+  before(() => {
+    writeModel(RELMEM_APP, RELMEM_MODEL);
+    ts.db.run(`INSERT INTO projects (name) VALUES ('program-relmem')`);
+    projectId = ts.db.get<{ id: number }>(
+      `SELECT id FROM projects WHERE name='program-relmem'`,
+    )!.id;
+    seedDevice(ts.db, projectId, deviceAddr, RELMEM_APP, [], []);
+  });
+
+  it('aborts with 409 segment_unallocated when PID 7 is zero, and never downloads', async () => {
+    mockBus.connected = true;
+    // obj 4 / PID 7 reports an unallocated segment.
+    mockBus.propImage = new Map([['4/7', Buffer.from('00000000', 'hex')]]);
+    const r = await req(ts.baseUrl, 'POST', '/bus/program-device', {
+      deviceAddress: deviceAddr,
+      projectId,
+    });
+    mockBus.propImage = null;
+    assert.equal(r.status, 409);
+    assert.equal((r.data as { error: string }).error, 'segment_unallocated');
+    assert.equal(
+      mockBus.calls.some((c) => c.method === 'downloadDevice'),
+      false,
+    );
+  });
+});
