@@ -301,6 +301,41 @@ export function isAbsSegmentProcedure(steps: PlanStep[]): boolean {
   );
 }
 
+// ── Legacy RelSegment download plan ─────────────────────────────────────────
+
+/**
+ * Pure planner for legacy RelSegment/WriteRelMem downloads: chunk the parameter
+ * image into A_Memory_Write-sized pieces at the segment's ABSOLUTE address
+ * (resolved base + relative offset). Mirrors the executor loop in
+ * downloadDevice so it can be diffed against a captured ETS download offline.
+ */
+export function planRelmemWrites(
+  steps: PlanStep[],
+  paramMem: Buffer | null,
+  bases: Record<number, number>,
+  chunkSize = 10,
+): Array<{ addr: number; bytes: Buffer }> {
+  const ops: Array<{ addr: number; bytes: Buffer }> = [];
+  if (!paramMem) return ops;
+  for (const s of steps) {
+    if (
+      s.type !== 'WriteRelMem' ||
+      typeof s.offset !== 'number' ||
+      typeof s.size !== 'number'
+    )
+      continue;
+    const base = bases[s.objIdx ?? 4] ?? 0;
+    const mem = paramMem.subarray(0, s.size);
+    for (let off = 0; off < mem.length; off += chunkSize) {
+      ops.push({
+        addr: base + s.offset + off,
+        bytes: mem.subarray(off, off + chunkSize),
+      });
+    }
+  }
+  return ops;
+}
+
 // ── Read-back verification plan ─────────────────────────────────────────────
 //
 // planVerify() derives, from the *same* artifacts as planDownload(), the exact

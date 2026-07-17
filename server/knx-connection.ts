@@ -102,6 +102,7 @@ export interface DownloadExtra {
   paramBase?: number | null;
   absSegData?: Record<number, AbsSegSeed>;
   appId?: string;
+  resolvedBases?: Record<number, number>;
 }
 
 // ── Device info type ───────────────────────────────────────────────────────────
@@ -683,16 +684,14 @@ export class KnxConnection extends EventEmitter {
           case 'WriteRelMem': {
             log(`WriteRelMem ObjIdx=${step.objIdx} Size=${step.size}`);
             if (!paramMem) throw new Error('Parameter memory not available');
+            const base = extra?.resolvedBases?.[step.objIdx ?? 4] ?? 0;
             const mem = paramMem.slice(0, step.size);
             for (let off = 0; off < mem.length; off += MEM_CHUNK) {
               const chunk = mem.slice(off, off + MEM_CHUNK);
               const seq = nextSeq();
+              const addr = base + step.offset! + off;
               const extra2 = Buffer.concat([
-                Buffer.from([
-                  chunk.length,
-                  ((step.offset! + off) >> 8) & 0xff,
-                  (step.offset! + off) & 0xff,
-                ]),
+                Buffer.from([chunk.length, (addr >> 8) & 0xff, addr & 0xff]),
                 chunk,
               ]);
               const apdu = apduConnected(seq, 'Memory_Write', extra2);
