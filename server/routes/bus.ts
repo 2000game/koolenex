@@ -6,6 +6,7 @@ import { z } from 'zod';
 import * as db from '../db.ts';
 import { APPS_DIR, getDptInfo } from './shared.ts';
 import { logger, safeError } from '../log.ts';
+import { resolveRelmemBases } from '../knx-segment-base.ts';
 import { validateBody } from '../validate.ts';
 import {
   buildGATable,
@@ -907,10 +908,22 @@ router.post('/bus/verify-device', async (req: Request, res: Response) => {
   //   relmem — each WriteRelMem segment becomes a paramMem read/diff;
   //   prop   — property-configured devices (no image) become property reads.
   //
-  // Note: memory reads use the legacy A_Memory_Read service. System B / System 7
-  // devices that answer only A_MemoryExtended_Read are not auto-detected here —
-  // b.readMemoryExtended() exists for that path but wiring it into verify needs
-  // a mask-version/device-descriptor probe first (tracked as follow-up).
+  // System B relmem segments live at a device-resident base (PID 7), not at
+  // the step's relative offset. Resolve it over the bus and refuse to verify
+  // an unallocated segment (a zero base would read the wrong low-memory region
+  // and report a bogus all-zeros mismatch).
+  const { bases, unallocated } = await resolveRelmemBases(
+    b,
+    deviceAddress,
+    steps as Array<{ type: string; objIdx?: number }>,
+  );
+  if (unallocated.length) {
+    return res.status(409).json({
+      error: 'segment_unallocated',
+      message: `Interface object(s) ${unallocated.join(', ')} report an unallocated segment (PID 7 = 0); device is not in a verifiable state.`,
+    });
+  }
+
   const plan = planVerify(
     steps as PlanStep[],
     gaTable,
@@ -919,6 +932,7 @@ router.post('/bus/verify-device', async (req: Request, res: Response) => {
     paramBase,
     absSegData,
     appId,
+    bases,
   );
 
   if (plan.family === 'none' || (!plan.mem.length && !plan.props.length))

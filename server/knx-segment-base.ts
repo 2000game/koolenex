@@ -20,3 +20,47 @@ export function parseTableReference(buf: Buffer): number | null {
   const addr = buf.readUInt32BE(0);
   return addr === 0 ? null : addr;
 }
+
+interface RelmemStep {
+  type: string;
+  objIdx?: number;
+}
+
+interface PropertyReader {
+  readPropertyMany(
+    deviceAddr: string,
+    reads: Array<{ objIdx: number; propId: number }>,
+  ): Promise<Buffer[]>;
+}
+
+/**
+ * Read PID 7 over the bus for each distinct WriteRelMem interface object and
+ * resolve its absolute base. Objects whose pointer is unallocated (0x00000000)
+ * are returned in `unallocated` so the caller can refuse to write.
+ */
+export async function resolveRelmemBases(
+  bus: PropertyReader,
+  deviceAddr: string,
+  steps: RelmemStep[],
+): Promise<{ bases: Record<number, number>; unallocated: number[] }> {
+  const objIdxs = [
+    ...new Set(
+      steps.filter((s) => s.type === 'WriteRelMem').map((s) => s.objIdx ?? 4),
+    ),
+  ];
+  if (objIdxs.length === 0) return { bases: {}, unallocated: [] };
+
+  const values = await bus.readPropertyMany(
+    deviceAddr,
+    objIdxs.map((objIdx) => ({ objIdx, propId: PID_TABLE_REFERENCE })),
+  );
+
+  const bases: Record<number, number> = {};
+  const unallocated: number[] = [];
+  objIdxs.forEach((objIdx, i) => {
+    const base = parseTableReference(values[i] ?? Buffer.alloc(0));
+    if (base == null) unallocated.push(objIdx);
+    else bases[objIdx] = base;
+  });
+  return { bases, unallocated };
+}
