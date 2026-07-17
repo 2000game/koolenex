@@ -155,3 +155,25 @@ describe('planVerify — degenerate input', () => {
     assert.equal(plan.props.length, 0);
   });
 });
+
+describe('planVerify relmem base resolution', () => {
+  const REL_STEPS: PlanStep[] = [
+    { type: 'RelSegment', lsmIdx: 4, size: 4 },
+    { type: 'WriteRelMem', objIdx: 4, offset: 0, size: 4 },
+  ];
+  const PARAM = Buffer.from('deadbeef', 'hex');
+
+  it('reads at offset only when no base is supplied (legacy default)', () => {
+    const plan = planVerify(REL_STEPS, null, null, PARAM, null);
+    assert.equal(plan.family, 'relmem');
+    assert.equal(plan.mem[0]!.addr, 0x0000);
+  });
+
+  it('reads at base + offset when a base is supplied for the objIdx', () => {
+    const plan = planVerify(REL_STEPS, null, null, PARAM, null, {}, '', {
+      4: 0x0200,
+    });
+    assert.equal(plan.mem[0]!.addr, 0x0200);
+    assert.equal(plan.mem[0]!.expected.toString('hex'), 'deadbeef');
+  });
+});

@@ -351,6 +351,7 @@ export function planVerify(
   paramBase: number | null,
   absSegData: Record<number, AbsSegSeed> = {},
   appId: string = '',
+  relBaseByObj: Record<number, number> = {},
 ): VerifyPlan {
   // AbsSegment (MDT-style): read back exactly what planDownload would stream.
   if (isAbsSegmentProcedure(steps)) {
@@ -387,10 +388,12 @@ export function planVerify(
     for (const s of relSegs) {
       const offset = s.offset as number;
       const size = s.size as number;
+      const objIdx = s.objIdx ?? 4;
+      const base = relBaseByObj[objIdx] ?? 0;
       mem.push({
-        addr: offset,
+        addr: base + offset,
         expected: paramMem.subarray(0, size),
-        label: `relmem@0x${offset.toString(16)}`,
+        label: `relmem@0x${(base + offset).toString(16)}`,
       });
     }
     return { family: 'relmem', mem, props: [] };
