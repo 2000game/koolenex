@@ -840,6 +840,21 @@ router.post('/bus/program-device', async (req: Request, res: Response) => {
   const { steps, gaTable, assocTable, paramMem, paramBase, absSegData, appId } =
     built;
 
+  // Resolve device-resident relmem bases (PID 7) and refuse to write to an
+  // unallocated segment — a zero base would target near-zero addresses and
+  // fail (the observed ETS first-attempt failure mode).
+  const { bases, unallocated } = await resolveRelmemBases(
+    b,
+    deviceAddress,
+    steps as Array<{ type: string; objIdx?: number }>,
+  );
+  if (unallocated.length) {
+    return res.status(409).json({
+      error: 'segment_unallocated',
+      message: `Interface object(s) ${unallocated.join(', ')} report an unallocated segment (PID 7 = 0); refusing to write.`,
+    });
+  }
+
   // Stream progress via WebSocket
   const onProgress = (p: DownloadProgress): void =>
     b.broadcast('program:progress', { deviceAddress, ...p });
@@ -853,7 +868,7 @@ router.post('/bus/program-device', async (req: Request, res: Response) => {
       assocTable,
       paramMem,
       onProgress,
-      { paramBase, absSegData, appId },
+      { paramBase, absSegData, appId, resolvedBases: bases },
     );
     db.run('UPDATE devices SET status=? WHERE id=?', ['programmed', dev.id]);
     db.scheduleSave();
